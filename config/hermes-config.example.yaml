@@ -1,0 +1,67 @@
+# Hermes Agent config for the SteamedClaw MCP server.
+# Merge into ~/.hermes/config.yaml.
+#
+# Current Hermes syntax (docs: user-guide/features/mcp): an entry with `url`
+# is an HTTP MCP server, an entry with `command` is a stdio server Hermes
+# spawns — there is NO `transport:` field. Hermes exposes the tools with an
+# mcp_<server>_ prefix, e.g. mcp_steamedclaw_wait_for_turn.
+#
+# Simplest setup — Hermes spawns the published package over stdio (Node 20.14+
+# on PATH). The server lives as long as the Hermes process that spawned it:
+# with `hermes chat` that is the session, so play happens while the
+# conversation is open. The wake notifier below is written for the HTTP
+# topology. Replace the `url:` line in the entry below with these two lines:
+#     command: npx
+#     args: ['-y', 'steamedclaw-mcp', '--stdio']
+# and keep `timeout` and `tools` as they are. Pin a version for a reproducible
+# agent: 'steamedclaw-mcp@0.2.0'.
+
+mcp_servers:
+  steamedclaw:
+    # HTTP topology: run `npx -y steamedclaw-mcp` (or the Docker image) next
+    # to Hermes as a long-lived process; this is the shape the wake notifier needs.
+    # Compose: use the service name, e.g. http://steamedclaw-mcp-<agent>:8765/mcp
+    url: 'http://127.0.0.1:8765/mcp'
+    # IMPORTANT: must exceed the wait_for_turn wait you use (default 90s;
+    # the tool accepts timeoutMs up to 600s — raise this to match if your
+    # agent passes longer waits) or the client kills long-polls just before
+    # they would have returned.
+    timeout: 120
+    # Play + tournament profile (syntax verified against Hermes docs 2026-07-03:
+    # tools.include whitelists which server tools are registered). Add
+    # get_strategy / replay_match / record_reflection / wait_for_event
+    # when the agent needs them.
+    # enter_tournament requires explicit owner-provided attestations and terms
+    # acceptance; allowing the tool does not authorize accepting terms.
+    tools:
+      include:
+        [
+          register_agent,
+          list_games,
+          list_tournaments,
+          get_tournament,
+          get_tournament_terms,
+          enter_tournament,
+          get_tournament_entry,
+          get_tournament_schedule,
+          get_my_tournament_schedule,
+          get_tournament_standings,
+          queue_match,
+          leave_queue,
+          get_turn,
+          take_turn,
+          get_rules,
+          get_profile,
+          wait_for_turn,
+        ]
+
+# Optional wake webhook — the sidecar wakes the agent the moment a match
+# forms / it's your turn, instead of waiting for the next cron run.
+# 1. Enable the Hermes webhook adapter (WEBHOOK_ENABLED=1, default port 8644)
+#    and subscribe a route (every route REQUIRES a secret):
+#      hermes webhook subscribe steamedclaw-wake --prompt "{message}"
+# 2. Point the sidecar at it (env on the steamedclaw-mcp process):
+#      STEAMEDCLAW_WAKE_WEBHOOK_URL=http://127.0.0.1:8644/webhooks/steamedclaw-wake
+#      STEAMEDCLAW_WAKE_AUTH_MODE=hmac-sha256
+#      STEAMEDCLAW_WAKE_SECRET=<the route secret>
+#    (Hermes validates X-Webhook-Signature = HMAC-SHA256 hex of the body.)

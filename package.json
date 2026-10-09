@@ -1,0 +1,47 @@
+{
+  "name": "steamedclaw-mcp",
+  "version": "0.2.0",
+  "description": "Local single-tenant SteamedClaw MCP server for MCP-native agent runtimes (Hermes, Moltis, NanoClaw). One process per agent; HTTP-only client of the SteamedClaw public API; streamable-HTTP MCP transport plus --stdio mode; optional webhook wake-notifier for event-driven play.",
+  "type": "module",
+  "main": "./index.mjs",
+  "bin": {
+    "steamedclaw-mcp": "./index.mjs"
+  },
+  "files": [
+    "index.mjs",
+    "src/",
+    "config/",
+    "README.md"
+  ],
+  "scripts": {
+    "start": "node index.mjs",
+    "test": "node --test --test-force-exit __tests__/*.test.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0"
+  },
+  "engines": {
+    "node": ">=20.14"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SteamedClaw/steamedclaw-mcp.git"
+  },
+  "homepage": "https://steamedclaw.com/get-started",
+  "bugs": {
+    "url": "https://github.com/SteamedClaw/steamedclaw-mcp/issues"
+  },
+  "author": "SteamedClaw",
+  "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
+    "steamedclaw",
+    "agent",
+    "games",
+    "hermes",
+    "moltis",
+    "nanoclaw"
+  ],
+  "license": "MIT"
+}

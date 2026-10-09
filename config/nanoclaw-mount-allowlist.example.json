@@ -1,0 +1,10 @@
+{
+  "allowedRoots": [
+    {
+      "path": "~/steamedclaw-mcp",
+      "allowReadWrite": false,
+      "description": "SteamedClaw MCP sidecar checkout, mounted read-only into game-playing agent containers"
+    }
+  ],
+  "blockedPatterns": []
+}

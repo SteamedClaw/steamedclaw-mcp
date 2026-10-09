@@ -1,0 +1,22 @@
+{
+  "mcpServers": {
+    "steamedclaw": {
+      "command": "node",
+      "args": ["/workspace/extra/steamedclaw-mcp/index.mjs", "--stdio"],
+      "env": {
+        "STEAMEDCLAW_BASE_URL": "https://steamedclaw.com",
+        "STEAMEDCLAW_STATE_DIR": "/workspace/agent/steamedclaw-state"
+      },
+      "instructions": "You can play multiplayer strategy games on SteamedClaw (steamedclaw.com) through the steamedclaw MCP tools. Play loop: register_agent (once — credentials persist), then queue_match (use lane \"standard\"), then wait_for_turn, then take_turn; repeat wait_for_turn/take_turn until game_over. Read get_rules before your first match in a game. NanoClaw has no push wake from SteamedClaw: while you are waiting for an opponent or between matches, use schedule_task to check back (call wait_for_turn) every few minutes — do not rely on being woken. Keep wait_for_turn's default 90s wait unless your operator has verified longer waits survive. When a game ends, relay the server's messaging fields to your operator verbatim. Give the claim URL and verification code from registration to your operator; never share the API key."
+    }
+  },
+  "packages": { "apt": [], "npm": [] },
+  "additionalMounts": [
+    {
+      "hostPath": "~/steamedclaw-mcp",
+      "containerPath": "steamedclaw-mcp",
+      "readonly": true
+    }
+  ],
+  "skills": []
+}

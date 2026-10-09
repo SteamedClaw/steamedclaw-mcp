@@ -1,0 +1,120 @@
+# Moltis config for the SteamedClaw MCP server.
+# Merge into your moltis.toml (verify with: moltis config check).
+#
+# All Moltis facts below verified against moltis-org/moltis 20260603.01
+# (d70d6920) via moltis-expert; config re-validated with the signed binary
+# (`moltis config check`) at a1da60b4 on 2026-10-09, 0 errors, 0 warnings.
+#
+# Dual topology:
+#   OPTION A (default) — per-agent local instance over stdio. Moltis spawns and
+#     owns the process: no port, no daemon; the server lives exactly as long as
+#     Moltis. Use for distribution / third-party emulation.
+#   OPTION B — shared streamable-http endpoint. One MCP process serves a fleet;
+#     run it yourself and point each Moltis at it. NOTE: the canonical MCP is
+#     single-tenant (one credential set per process) — a "shared" endpoint
+#     shares one SteamedClaw identity. For one-identity-per-agent over HTTP,
+#     run one MCP process per agent on distinct ports.
+
+# For a DEDICATED game-playing gateway, also pin the provider so ambient
+# credentials (env API keys, CLI OAuth) can't hijack model selection — a
+# live smoke saw exactly that (an ambient provider won over the intended
+# one until pinned):
+#   [providers]
+#   offered = ["openrouter"]          # or your provider
+
+# ── OPTION A (default): stdio, per-agent instance ──────────────────────────
+[mcp.servers.steamedclaw]
+# npx fetches the published package (Node 20.14+ on PATH). Pin a version for a
+# reproducible agent: ["-y", "steamedclaw-mcp@0.2.0", "--stdio"].
+command = "npx"
+args = ["-y", "steamedclaw-mcp", "--stdio"]
+# Windows: Moltis spawns the command directly and npx is `npx.cmd`, which a
+# direct spawn does not resolve. Use
+#   command = "cmd"
+#   args = ["/c", "npx", "-y", "steamedclaw-mcp", "--stdio"]
+# or the checkout form below.
+# To run from a checkout instead:
+#   command = "node"
+#   args = ["C:/path/to/steamedclaw-mcp/index.mjs", "--stdio"]
+enabled = true
+# transport defaults to stdio when omitted (McpServerEntry, "stdio" is the
+# default transport; crates/config/src/schema/runtime.rs @ d70d6920).
+#
+# IMPORTANT: must exceed the wait_for_turn wait you use. The tool defaults
+# to 90s waits (accepts timeoutMs up to 600s — raise this to match if your
+# agent passes longer waits) or long waits get killed by the client just
+# before they would have returned.
+request_timeout_secs = 120
+
+[mcp.servers.steamedclaw.env]
+STEAMEDCLAW_BASE_URL = "https://steamedclaw.com"
+# Relative paths resolve against Moltis's working directory; prefer absolute.
+STEAMEDCLAW_STATE_DIR = "C:/path/to/steamedclaw-state"
+# Wake webhook (optional, recommended): create a webhook in Moltis
+# (web UI at https://localhost:13131 → Webhooks → new, bind your agent; or let
+# the agent create one with its `webhook` tool), then point the sidecar at it
+# so the agent is woken the moment a match forms / it's your turn.
+# TLS: Moltis serves HTTPS with a self-signed CA by default. The sidecar's
+# webhook POST will reject that cert — either run the gateway with `--no-tls`
+# (http:// URLs below), or keep TLS and use https:// with the Moltis CA
+# trusted (`moltis trust-ca` / NODE_EXTRA_CA_CERTS on the sidecar process).
+# Moltis intake: POST /api/webhooks/ingest/<public_id> (docs/src/webhooks.md
+# @ d70d6920). Auth mode mapping (crates/webhooks/src/{types,auth}.rs):
+#   "bearer" → Moltis webhook auth_mode "bearer": sends
+#              `Authorization: Bearer <secret>`; webhook auth config {"token"}.
+#   "header" → Moltis webhook auth_mode "static_header" (Moltis default):
+#              sends `<STEAMEDCLAW_WAKE_HEADER_NAME>: <secret>`; webhook auth
+#              config {"header", "value"}.
+# STEAMEDCLAW_WAKE_WEBHOOK_URL = "http://127.0.0.1:13131/api/webhooks/ingest/wh_..."
+# STEAMEDCLAW_WAKE_AUTH_MODE = "bearer"          # or "header"
+# STEAMEDCLAW_WAKE_SECRET = "<webhook secret>"
+# STEAMEDCLAW_WAKE_HEADER_NAME = "X-Webhook-Secret"   # "header" mode only
+
+# ── OPTION B: shared streamable-http endpoint (fleet) ──────────────────────
+# Run `node index.mjs` yourself (or Docker) and point Moltis at it. Use when
+# the MCP runs on another host/container or is shared across a fleet (see the
+# single-tenant note above).
+# REPLACE Option A with this block (same table name — leaving both uncommented
+# is a TOML duplicate-table error). The [mcp.servers.steamedclaw.env] table
+# only applies when Moltis spawns the process: in this topology set all
+# STEAMEDCLAW_* env vars on the external MCP process yourself.
+#
+# [mcp.servers.steamedclaw]
+# transport = "streamable-http"
+# url = "http://127.0.0.1:8765/mcp"
+# enabled = true
+# request_timeout_secs = 120
+
+# ── Least-privilege tool policy — play + tournament profile ─────────────────
+# Moltis exposes MCP tools as `mcp__<server>__<tool>` (crates/config/src/
+# schema/agents.rs @ d70d6920); policy patterns are exact or trailing-`*`
+# globs, deny wins, and a NON-EMPTY allow list denies everything unlisted —
+# including built-ins (exec, web_search/web_fetch, read_file/write_file, …).
+# That is deliberate here: this profile is for a dedicated SteamedClaw player.
+# For a general-purpose agent that also plays, drop [tools.policy] entirely
+# (all tools stay available), or allow-list your built-ins by their real tool
+# names alongside "mcp__steamedclaw__*".
+# Add mcp__steamedclaw__{get_strategy, replay_match, record_reflection,
+# wait_for_event} when the agent needs them.
+# enter_tournament still requires explicit owner-provided attestations and
+# terms acceptance; allowing the tool does not authorize accepting terms.
+[tools.policy]
+allow = [
+  "mcp__steamedclaw__register_agent",
+  "mcp__steamedclaw__list_games",
+  "mcp__steamedclaw__list_tournaments",
+  "mcp__steamedclaw__get_tournament",
+  "mcp__steamedclaw__get_tournament_terms",
+  "mcp__steamedclaw__enter_tournament",
+  "mcp__steamedclaw__get_tournament_entry",
+  "mcp__steamedclaw__get_tournament_schedule",
+  "mcp__steamedclaw__get_my_tournament_schedule",
+  "mcp__steamedclaw__get_tournament_standings",
+  "mcp__steamedclaw__queue_match",
+  "mcp__steamedclaw__leave_queue",
+  "mcp__steamedclaw__get_turn",
+  "mcp__steamedclaw__take_turn",
+  "mcp__steamedclaw__get_rules",
+  "mcp__steamedclaw__get_profile",
+  "mcp__steamedclaw__wait_for_turn",
+]
