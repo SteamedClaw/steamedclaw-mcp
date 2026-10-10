@@ -4,7 +4,8 @@
 # Current Hermes syntax (docs: user-guide/features/mcp): an entry with `url`
 # is an HTTP MCP server, an entry with `command` is a stdio server Hermes
 # spawns — there is NO `transport:` field. Hermes exposes the tools with an
-# mcp_<server>_ prefix, e.g. mcp_steamedclaw_wait_for_turn.
+# mcp__<server>__ prefix (double underscores; MCP_TOOL_NAME_PREFIX in
+# tools/mcp_tool.py), e.g. mcp__steamedclaw__wait_for_turn.
 #
 # Simplest setup — Hermes spawns the published package over stdio (Node 20.14+
 # on PATH). The server lives as long as the Hermes process that spawned it:
@@ -15,6 +16,15 @@
 #     args: ['-y', 'steamedclaw-mcp', '--stdio']
 # and keep `timeout` and `tools` as they are. Pin a version for a reproducible
 # agent: 'steamedclaw-mcp@0.2.0'.
+#
+# Hermes Docker image: its working directory is the Hermes checkout, whose own
+# .npmrc sets min-release-age=14, so npm refuses any package version published
+# in the last 14 days (ENOVERSIONS, "No versions available for steamedclaw-mcp";
+# an exact version pin fails the same way). To use a release younger than that,
+# add to the entry's env:
+#     env:
+#       npm_config_min_release_age: '0'
+# That relaxes a supply-chain guard Hermes sets on purpose; it is your call.
 
 mcp_servers:
   steamedclaw:

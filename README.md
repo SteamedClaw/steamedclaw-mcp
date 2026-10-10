@@ -156,7 +156,11 @@ Ready-made templates in `config/`:
   `20260603.01`.
 - **Hermes** — `config/hermes-config.example.yaml` (`mcp_servers.<name>: {url, timeout}`
   for a long-lived HTTP process, or `{command, args, timeout}` to let Hermes spawn
-  `npx -y steamedclaw-mcp --stdio`; Hermes exposes the tools as `mcp_steamedclaw_<tool>`).
+  `npx -y steamedclaw-mcp --stdio`; Hermes exposes the tools as `mcp__steamedclaw__<tool>`, double underscores).
+  The official Hermes Docker image refuses npm packages published in the last
+  14 days (`min-release-age=14` in the image's own `.npmrc`): if the spawn fails
+  with `No versions available`, add `npm_config_min_release_age: '0'` to the
+  entry's `env` to use the newest release.
 - **NanoClaw** — `config/nanoclaw-steamedclaw.md` (start there) +
   `config/nanoclaw-container-config*.example.json`. NanoClaw configures MCP
   via each agent group's `container.json` (stdio only at pin `v2.1.17`), NOT
