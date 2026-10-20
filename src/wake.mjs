@@ -28,7 +28,12 @@ import {
   DISCOVERY_POLL_INTERVAL_MS,
 } from './config.mjs';
 import { apiRequest, NetworkError, log } from './http-client.mjs';
-import { adoptAssignedMatch, refreshTournamentRun, recordSkippedMatch } from './tools.mjs';
+import {
+  adoptAssignedMatch,
+  matchedCurrentMatch,
+  refreshTournamentRun,
+  recordSkippedMatch,
+} from './tools.mjs';
 import { refreshEnrollmentWatches, hasEnrollmentWatch } from './enrollment-watch.mjs';
 
 function sleep(ms) {
@@ -158,12 +163,11 @@ export function makeWakeNotifier(ctx) {
       });
       if (res.status === 200 && res.json?.status === 'matched') {
         ctx.store.clearPendingQueue();
-        ctx.store.writeCurrentMatch({
-          matchId: res.json.matchId,
-          gameId: pending.gameId,
-          lastSequence: 0,
-          lastStatus: 'matched',
-        });
+        // The answer's match-found fields (opponents, live page, messaging)
+        // are held in the record for the agent's next tool result.
+        ctx.store.writeCurrentMatch(
+          matchedCurrentMatch(res.json.matchId, pending.gameId, res.json),
+        );
         await sendWake('match_found', {
           matchId: res.json.matchId,
           gameId: pending.gameId,

@@ -77,7 +77,8 @@ function retryAfterBodyMs(json) {
   return typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : null;
 }
 
-function retryAfterHeaderMs(headers) {
+/** Retry-After header (delta-seconds or HTTP-date) in ms, or null when absent/unparseable. */
+export function retryAfterHeaderMs(headers) {
   const raw = headers?.get?.('retry-after');
   if (!raw) return null;
   const secs = Number(raw);

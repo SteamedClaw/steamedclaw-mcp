@@ -33,6 +33,8 @@ export const RATE_LIMIT_JITTER_MAX_MS = 100;
 
 /** Default per-request HTTP timeout (ms); long-polls get the server hold + slack. */
 export const HTTP_TIMEOUT_MS = 20_000;
+/** Game-over claim-status read: short, so a slow server barely delays the result (ms). */
+export const CLAIM_CHECK_TIMEOUT_MS = 5_000;
 /** Server holds ?wait=true long-polls up to 30s; allow that plus slack. */
 export const LONG_POLL_TIMEOUT_MS = 40_000;
 

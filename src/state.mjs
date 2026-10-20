@@ -7,7 +7,11 @@
 //
 // Files under the state dir:
 //   credentials.json   {server, agentId, apiKey, name, registeredAt, ownerSeen?}
-//   current-match.json {matchId, gameId, lastSequence, lastStatus, updatedAt}
+//   current-match.json {matchId, gameId, lastSequence, lastStatus, lastMessageCount?,
+//                      matchFound?, updatedAt}
+//                      matchFound: the match-found fields of a matchmaking
+//                      status answer, held until the first tool result for
+//                      that match delivers them
 //   pending-queue.json {gameId, lane, queuedAt}
 //   tournament-run.json {sinceMatchId, gameId, setAt, skippedMatchIds?}
 //                      present while the server's game-over said the agent's

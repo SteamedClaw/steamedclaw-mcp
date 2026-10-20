@@ -23,8 +23,15 @@ import {
   REPLAY_MAX_BYTES,
   REFLECTION_MAX_PER_DAY,
   REFLECTION_MAX_TEXT_LEN,
+  CLAIM_CHECK_TIMEOUT_MS,
 } from './config.mjs';
-import { apiRequest, NetworkError, log, redactSecrets } from './http-client.mjs';
+import {
+  apiRequest,
+  NetworkError,
+  log,
+  redactSecrets,
+  retryAfterHeaderMs,
+} from './http-client.mjs';
 import { TOURNAMENT_TOOL_DEFS, tournamentRequest } from './tournament-tools.mjs';
 import {
   recordEnrollment,
@@ -57,13 +64,184 @@ function setLastError(ctx, message) {
   ctx.health.lastError = message ?? null;
 }
 
+// ---------------------------------------------------------------------------
+// Server messaging passthrough
+// ---------------------------------------------------------------------------
+//
+// Lifecycle responses (registration, queue, match found, game over, the game
+// limit) carry a server-authored `messaging` object. It is forwarded WHOLE,
+// never field by field, so a field the server adds later reaches the agent
+// with no client release. Two readers, never swapped: `toAgent` (at game over,
+// `encouragement`) is written for the agent; `forOperator` is written about
+// the agent for their human and is relayed as is. This client only adds
+// structural guidance saying which is which.
+
+/** `{ messaging }` when the response carries a messaging object, else `{}`. */
+function messagingField(json) {
+  const m = json?.messaging;
+  return m && typeof m === 'object' && !Array.isArray(m) ? { messaging: m } : {};
+}
+
+/**
+ * Relay guidance for a forwarded messaging object. `at` is where the object
+ * sits in the tool result ('messaging' or 'matchFound.messaging'). Only the
+ * fields that are present are named.
+ */
+function relayGuidance(messaging, at) {
+  if (!messaging || typeof messaging !== 'object') return [];
+  return [
+    ...(typeof messaging.toAgent === 'string'
+      ? [`${at}.toAgent is written for you: act on it, do not relay it.`]
+      : []),
+    ...(typeof messaging.forOperator === 'string'
+      ? [
+          `Relay ${at}.forOperator to your operator as is: it is written for them and carries any link they need.`,
+        ]
+      : []),
+  ];
+}
+
+/**
+ * The match-found fields of a `matched` answer (queue or status): the game's
+ * display name, the live page, the other seats (`opponentDetails`; the id-only
+ * lists stay where the server put them) and `messaging` whole. Absent fields
+ * stay absent.
+ */
+function matchFoundFields(json) {
+  return {
+    ...(typeof json?.gameName === 'string' ? { gameName: json.gameName } : {}),
+    ...(typeof json?.watchUrl === 'string' && json.watchUrl ? { watchUrl: json.watchUrl } : {}),
+    ...(Array.isArray(json?.opponentDetails) ? { opponentDetails: json.opponentDetails } : {}),
+    ...messagingField(json),
+  };
+}
+
+/** Guidance for match-found fields; `at` is '' (top level) or 'matchFound.'. */
+function matchFoundGuidance(fields, at) {
+  return [
+    ...relayGuidance(fields.messaging, `${at}messaging`),
+    ...(fields.watchUrl
+      ? [
+          `${at}watchUrl is the live page for this match: offer it to your operator if they are around.`,
+        ]
+      : []),
+  ];
+}
+
+/**
+ * The current-match record for a match learned from a matchmaking status
+ * `matched` answer. Its match-found fields are held in the record until the
+ * first tool result for that match delivers them (see withMatchFound): the
+ * status read happens inside wait_for_turn, get_turn or the wake notifier, so
+ * the answer itself never reaches the agent. Exported for the wake notifier.
+ */
+export function matchedCurrentMatch(matchId, gameId, json) {
+  const matchFound = matchFoundFields(json);
+  return {
+    matchId,
+    gameId,
+    lastSequence: 0,
+    lastStatus: 'matched',
+    ...(Object.keys(matchFound).length > 0 ? { matchFound } : {}),
+  };
+}
+
+/**
+ * Attach held match-found fields to a tool result, with their guidance. A
+ * failed seat read leaves only gameName (and watchUrl), so opponentDetails is
+ * named only when it is there.
+ */
+function withMatchFound(result, matchFound) {
+  if (!matchFound) return result;
+  return {
+    ...result,
+    matchFound,
+    guidance: [
+      result.guidance,
+      Array.isArray(matchFound.opponentDetails)
+        ? 'matchFound is the server notice for this match (opponentDetails names who you are playing).'
+        : 'matchFound is the server notice for this match.',
+      ...matchFoundGuidance(matchFound, 'matchFound.'),
+    ]
+      .filter(Boolean)
+      .join(' '),
+  };
+}
+
+/**
+ * A status `not_queued` answer. Any messaging it carries is forwarded whole,
+ * like every other lifecycle response.
+ */
+function notQueuedResult(ctx, json, normalHint) {
+  const forwarded = messagingField(json);
+  return {
+    ok: false,
+    error: 'not_queued',
+    ...forwarded,
+    hint: [idleHint(ctx, normalHint), ...relayGuidance(forwarded.messaging, 'messaging')].join(' '),
+  };
+}
+
+/**
+ * The queue's rolling game-limit 429 (`error: 'game_limit_reached'`). Unlike a
+ * rate limit, retrying soon cannot succeed: the wait is hours, not a second.
+ * The server's message, claimUrl and messaging are forwarded verbatim; the
+ * wait comes from the body's retryAfterSeconds, else the Retry-After header.
+ */
+function gameLimitResult(json, headers) {
+  const bodySecs = json?.retryAfterSeconds;
+  let retryAfterSeconds =
+    typeof bodySecs === 'number' && Number.isFinite(bodySecs) && bodySecs >= 0 ? bodySecs : null;
+  if (retryAfterSeconds === null) {
+    const headerMs = retryAfterHeaderMs(headers);
+    if (headerMs !== null) retryAfterSeconds = Math.ceil(headerMs / 1000);
+  }
+  const claimUrl = typeof json?.claimUrl === 'string' && json.claimUrl ? json.claimUrl : null;
+  const message = typeof json?.message === 'string' ? json.message : null;
+  const forwarded = messagingField(json);
+  const serverRelay = relayGuidance(forwarded.messaging, 'messaging');
+  const hasForOperator = typeof forwarded.messaging?.forOperator === 'string';
+  return {
+    ok: false,
+    error: 'game_limit_reached',
+    ...(message !== null ? { message } : {}),
+    ...(json?.limit !== undefined ? { limit: json.limit } : {}),
+    ...(json?.windowHours !== undefined ? { windowHours: json.windowHours } : {}),
+    ...(retryAfterSeconds !== null ? { retryAfterSeconds } : {}),
+    ...(claimUrl ? { claimUrl } : {}),
+    ...forwarded,
+    // The server's `message` and `messaging.toAgent` are addressed to the
+    // agent, so they are forwarded for the agent to read. Only
+    // `messaging.forOperator` is for the human; a server without it gets the
+    // client's own claimUrl instruction instead.
+    hint: [
+      'You have used your rolling game allowance, so queue_match cannot succeed yet.',
+      ...(serverRelay.length === 0 && message !== null
+        ? ['message is the server explanation, written to you.']
+        : []),
+      ...serverRelay,
+      retryAfterSeconds !== null
+        ? 'Do not call queue_match again until retryAfterSeconds have passed.'
+        : 'Do not call queue_match again until a slot opens in the rolling window.',
+      ...(claimUrl && !hasForOperator
+        ? [
+            'Tell your operator you have reached the game limit and give them claimUrl: claiming this agent raises the limit.',
+          ]
+        : []),
+    ].join(' '),
+  };
+}
+
 /** Map transport/auth failures to actionable tool results. Returns null when not applicable. */
-function mapCommonHttpErrors(ctx, status, json) {
+function mapCommonHttpErrors(ctx, status, json, headers) {
   if (status === 401) {
     const msg =
       'API key rejected by the server. Check credentials.json in the state directory, or re-register with a new name via the register tool.';
     setLastError(ctx, 'unauthorized');
     return { ok: false, error: 'unauthorized', hint: msg };
+  }
+  if (status === 429 && json?.error === 'game_limit_reached') {
+    return gameLimitResult(json, headers);
   }
   if (status === 429) {
     return {
@@ -326,13 +504,68 @@ function messagesTail(messages) {
 }
 
 /**
- * Build the game_over tool result. The server's terminal envelope is forwarded
- * VERBATIM — results, rating, suggestions, newBadges, shareText, replay URLs,
- * and the messaging object are server-authored; this client never edits,
- * replaces, or cherry-picks that content. Only structural guidance is added.
+ * Claim status from a GET /api/agents/me body. `claim.claimed` is the source
+ * of truth. A server older than the `claim` block exposes only `owner`, which
+ * it includes only when the owner set a display name, so that fallback reads
+ * a claimed agent with a nameless owner as unclaimed.
+ * Returns {claimed, claimUrl} (claimUrl only while unclaimed, else null).
  */
-function buildGameOverResult(ctx, st) {
+function claimFromProfile(profile) {
+  const claim = profile?.claim;
+  if (claim && typeof claim === 'object' && typeof claim.claimed === 'boolean') {
+    const claimUrl =
+      !claim.claimed && typeof claim.claimUrl === 'string' && claim.claimUrl
+        ? claim.claimUrl
+        : null;
+    return { claimed: claim.claimed, claimUrl };
+  }
+  return { claimed: Boolean(profile?.owner), claimUrl: null };
+}
+
+/**
+ * Game-over claim nudge gate. Only when the nudge could fire (claim.md exists
+ * and no claim has been seen yet) the server is asked, so a claimed agent that
+ * never called get_profile stops being nagged and the read stops once the
+ * claim is seen. Any failure keeps the nudge with the claim.md pointer.
+ * Returns {nudge, claimUrl}.
+ */
+async function resolveClaimNudge(ctx) {
   const creds = ctx.store.readCredentials();
+  if (!creds || creds.ownerSeen || !ctx.store.readClaimFile()) {
+    return { nudge: false, claimUrl: null };
+  }
+  try {
+    const res = await apiRequest({
+      path: '/api/agents/me',
+      baseUrl: creds.server,
+      apiKey: creds.apiKey,
+      timeoutMs: CLAIM_CHECK_TIMEOUT_MS,
+      retryOn429: false,
+      fetchImpl: ctx.fetchImpl,
+    });
+    if (res.status === 200 && res.json && typeof res.json === 'object') {
+      const { claimed, claimUrl } = claimFromProfile(res.json);
+      if (claimed) {
+        ctx.store.updateCredentials({ ownerSeen: true });
+        return { nudge: false, claimUrl: null };
+      }
+      return { nudge: true, claimUrl };
+    }
+  } catch (err) {
+    if (!(err instanceof NetworkError)) throw err;
+  }
+  return { nudge: true, claimUrl: null };
+}
+
+/**
+ * Build the game_over tool result. The server's terminal envelope is forwarded
+ * VERBATIM — results, rating, suggestions, newBadges, shareText, replay and
+ * match URLs, and the messaging object are server-authored; this client never
+ * edits, replaces, or cherry-picks that content. Only structural guidance is
+ * added. `claimNudge` comes from resolveClaimNudge; `matchFound` is held
+ * match-found fields not yet delivered (a match that ended before any turn).
+ */
+function buildGameOverResult(ctx, st, claimNudge, matchFound) {
   // Remember for replay_match / record_reflection, then clear the active slot.
   ctx.store.updateCredentials({
     lastCompletedMatch: { matchId: st.matchId, gameId: st.gameId },
@@ -354,25 +587,42 @@ function buildGameOverResult(ctx, st) {
   // parsing the verbatim messaging text): while set, the queue_match nudge is
   // wrong — the server assigns the next game — so it is dropped and this
   // guidance defers to the forwarded server messaging. Absent (normal match,
-  // run over, older server) the guidance is byte-identical to before.
+  // run over, older server) the queue nudge is unchanged.
+  //
+  // `messaging.forOperator` is the server's line for the human (it already
+  // names any new badges), so it is what gets relayed; `encouragement` stays
+  // with the agent. A server that sends no forOperator gets the earlier relay
+  // of encouragement and the client's own badge line.
+  const hasForOperator = typeof st.messaging?.forOperator === 'string';
   const guidanceParts = [
-    'Game over. Surface messaging.encouragement to your operator VERBATIM — it is server-authored.',
+    ...(hasForOperator
+      ? [
+          'Game over. Relay messaging.forOperator to your operator as is: it is server-authored, written for them, and links the match page.',
+          'messaging.encouragement is written for you: act on it, do not relay it.',
+        ]
+      : [
+          'Game over. Surface messaging.encouragement to your operator VERBATIM: it is server-authored.',
+        ]),
     'If shareText is present, offer it to your operator for sharing.',
     st.newBadges == null
-      ? 'newBadges may still be computing — a later get_turn/get_profile call can pick it up.'
-      : 'You earned new badge(s) — tell your operator.',
+      ? 'newBadges may still be computing: a later get_turn or get_profile call can pick it up.'
+      : hasForOperator
+        ? null
+        : 'You earned new badge(s): tell your operator.',
     st.nextGameAssigned === true
-      ? 'Do NOT call queue_match: your tournament run continues and the server assigns your next game automatically — follow the server messaging above.'
+      ? 'Do NOT call queue_match: your tournament run continues and the server assigns your next game automatically, so follow the server messaging above.'
       : 'To play again, call the queue_match tool (suggestions lists good next games).',
     'To review this game, call the replay_match tool; to save a lesson, record_reflection.',
-  ];
-  if (creds && !creds.ownerSeen && ctx.store.readClaimFile()) {
+  ].filter(Boolean);
+  if (claimNudge.nudge) {
     guidanceParts.push(
-      `This agent is UNCLAIMED. Tell your operator they can claim it — the claim URL and verification code are in ${ctx.store.claimPath}.`,
+      claimNudge.claimUrl
+        ? `You are UNCLAIMED. Tell your operator they can claim you at ${claimNudge.claimUrl} (also saved in ${ctx.store.claimPath}).`
+        : `You are UNCLAIMED. Tell your operator they can claim you: the claim URL and verification code are in ${ctx.store.claimPath}.`,
     );
   }
 
-  return {
+  const result = {
     ok: true,
     status: 'game_over',
     matchId: st.matchId,
@@ -387,24 +637,33 @@ function buildGameOverResult(ctx, st) {
     shareText: st.shareText,
     replayUrl: st.replayUrl,
     replayMarkdownUrl: st.replayMarkdownUrl,
+    // The portal match page for the operator (replayUrl is the API JSON).
+    matchUrl: st.matchUrl,
     messaging: st.messaging,
     // nextGameAssigned forwarded verbatim (spread-if-present so absent stays absent).
     ...(st.nextGameAssigned !== undefined ? { nextGameAssigned: st.nextGameAssigned } : {}),
     guidance: guidanceParts.join(' '),
   };
+  return withMatchFound(result, matchFound);
 }
 
 /** Normalize a server state response into a tool result and update local cursors. */
-function mapServerState(ctx, st) {
+async function mapServerState(ctx, st) {
   if (!st || typeof st !== 'object' || typeof st.status !== 'string') {
     return { ok: false, error: 'unexpected_response', details: st ?? null };
   }
 
+  // Match-found fields held from a status read are delivered on the first
+  // result for that match, then dropped: the record written below (and
+  // game_over's clear) no longer carries them.
+  const current = ctx.store.readCurrentMatch();
+  const matchFound =
+    current?.matchFound && current.matchId === st.matchId ? current.matchFound : null;
+
   if (st.status === 'game_over') {
-    return buildGameOverResult(ctx, st);
+    return buildGameOverResult(ctx, st, await resolveClaimNudge(ctx), matchFound);
   }
 
-  const current = ctx.store.readCurrentMatch();
   const msgs = messagesTail(st.messages);
   const update = {
     matchId: st.matchId,
@@ -418,50 +677,59 @@ function mapServerState(ctx, st) {
   ctx.store.writeCurrentMatch(update);
 
   if (st.status === 'your_turn') {
-    return {
-      ok: true,
-      status: 'your_turn',
-      matchId: st.matchId,
-      gameId: st.gameId,
-      sequence: st.sequence,
-      view: st.view,
-      ...(st.turnEndsAt !== undefined ? { turnEndsAt: st.turnEndsAt } : {}),
-      ...(msgs !== undefined ? { messages: msgs } : {}),
-      guidance: [
-        'It is your turn. Choose an action from the view and submit it with the take_turn tool.',
-        st.turnEndsAt
-          ? `Act BEFORE ${st.turnEndsAt} — missing the deadline forfeits/damages your reliability rating.`
-          : 'Act promptly — turns have deadlines.',
-        'The rules tool for this game documents valid actions. {type:"resign"} is always legal.',
-      ].join(' '),
-    };
+    return withMatchFound(
+      {
+        ok: true,
+        status: 'your_turn',
+        matchId: st.matchId,
+        gameId: st.gameId,
+        sequence: st.sequence,
+        view: st.view,
+        ...(st.turnEndsAt !== undefined ? { turnEndsAt: st.turnEndsAt } : {}),
+        ...(msgs !== undefined ? { messages: msgs } : {}),
+        guidance: [
+          'It is your turn. Choose an action from the view and submit it with the take_turn tool.',
+          st.turnEndsAt
+            ? `Act BEFORE ${st.turnEndsAt} — missing the deadline forfeits/damages your reliability rating.`
+            : 'Act promptly — turns have deadlines.',
+          'The rules tool for this game documents valid actions. {type:"resign"} is always legal.',
+        ].join(' '),
+      },
+      matchFound,
+    );
   }
 
   if (st.status === 'discussion') {
-    return {
-      ok: true,
-      status: 'discussion',
-      matchId: st.matchId,
-      gameId: st.gameId,
-      sequence: st.sequence,
-      view: st.view,
-      messages: msgs ?? [],
-      guidance:
-        'Discussion phase — the floor is open. Send table talk with the take_turn tool using action {type:"message", text:"...", to?:"<agentId>"} (this does NOT consume your turn). When the game needs your phase commitment it will be delivered as your_turn — keep using the wait_for_turn tool.',
-    };
+    return withMatchFound(
+      {
+        ok: true,
+        status: 'discussion',
+        matchId: st.matchId,
+        gameId: st.gameId,
+        sequence: st.sequence,
+        view: st.view,
+        messages: msgs ?? [],
+        guidance:
+          'Discussion phase — the floor is open. Send table talk with the take_turn tool using action {type:"message", text:"...", to?:"<agentId>"} (this does NOT consume your turn). When the game needs your phase commitment it will be delivered as your_turn — keep using the wait_for_turn tool.',
+      },
+      matchFound,
+    );
   }
 
   // waiting / not_started
-  return {
-    ok: true,
-    status: st.status,
-    matchId: st.matchId,
-    gameId: st.gameId,
-    sequence: st.sequence,
-    ...(st.pollAfterMs !== undefined ? { pollAfterMs: st.pollAfterMs } : {}),
-    guidance:
-      'Not your turn yet. Call the wait_for_turn tool — it blocks until your turn arrives (or its timeout passes) instead of burning polls.',
-  };
+  return withMatchFound(
+    {
+      ok: true,
+      status: st.status,
+      matchId: st.matchId,
+      gameId: st.gameId,
+      sequence: st.sequence,
+      ...(st.pollAfterMs !== undefined ? { pollAfterMs: st.pollAfterMs } : {}),
+      guidance:
+        'Not your turn yet. Call the wait_for_turn tool — it blocks until your turn arrives (or its timeout passes) instead of burning polls.',
+    },
+    matchFound,
+  );
 }
 
 async function fetchState(ctx, creds, matchId, { wait = false, afterSequence, timeoutMs } = {}) {
@@ -567,6 +835,27 @@ async function registerAgent(ctx, args) {
       setLastError(ctx, null);
       // The apiKey is intentionally NOT included in this result: it lives in
       // credentials.json only and must never enter the agent's context.
+      const forwarded = messagingField(res.json);
+      // The server's forOperator line carries the claim link, so it replaces
+      // this client's own claim notice. A server without it keeps the notice.
+      if (typeof forwarded.messaging?.forOperator === 'string') {
+        return {
+          ok: true,
+          status: 'registered',
+          agentId: id,
+          name,
+          claimUrl,
+          verificationCode,
+          ...forwarded,
+          guidance: [
+            `Registered on ${ctx.cfg.baseUrl}.`,
+            ...relayGuidance(forwarded.messaging, 'messaging'),
+            `The claim link and verification code are also saved in ${ctx.store.claimPath}.`,
+            'This server has already stored your API key and never shows it to you, so there is nothing for you to save.',
+            'Call queue_match to play your first game.',
+          ].join(' '),
+        };
+      }
       return {
         ok: true,
         status: 'registered',
@@ -574,6 +863,7 @@ async function registerAgent(ctx, args) {
         name,
         claimUrl,
         verificationCode,
+        ...forwarded,
         operatorNotice: `Registered on ${ctx.cfg.baseUrl}. Give the claim URL + verification code to your operator so they can claim this agent (also saved to claim.md in the state directory). Call queue_match to play your first game.`,
       };
     }
@@ -739,13 +1029,17 @@ async function queueMatch(ctx, args) {
         lastSequence: 0,
         lastStatus: 'matched',
       });
+      const matchFound = matchFoundFields(res.json);
       return {
         ok: true,
         status: 'matched',
         matchId: res.json.matchId,
         players: res.json.players,
-        guidance:
-          'Matched! Call the wait_for_turn tool now — it returns when the game starts and it is your turn.',
+        ...matchFound,
+        guidance: [
+          'Matched! Call the wait_for_turn tool now: it returns when the game starts and it is your turn.',
+          ...matchFoundGuidance(matchFound, ''),
+        ].join(' '),
       };
     }
     if (
@@ -754,12 +1048,16 @@ async function queueMatch(ctx, args) {
     ) {
       ctx.store.writePendingQueue({ gameId, lane: lane ?? 'standard' });
       ctx.store.clearTournamentRun(); // Tournament run: see above
+      const forwarded = messagingField(res.json);
       return {
         ok: true,
         status: res.json.status,
         position: res.json.position,
-        guidance:
-          'Queued. Call the wait_for_turn tool — it watches the queue and returns when a match forms and it is your turn. If a wake webhook is configured for this server, you may instead end your session; you will be woken when a match is found.',
+        ...forwarded,
+        guidance: [
+          'Queued. Call the wait_for_turn tool: it watches the queue and returns when a match forms and it is your turn. If a wake webhook is configured for this server, you may instead end your session; you will be woken when a match is found.',
+          ...relayGuidance(forwarded.messaging, 'messaging'),
+        ].join(' '),
       };
     }
     if (res.status === 404) {
@@ -769,7 +1067,7 @@ async function queueMatch(ctx, args) {
         hint: `Unknown gameId "${gameId}". Call the list_games tool for valid ids.`,
       };
     }
-    const common = mapCommonHttpErrors(ctx, res.status, res.json);
+    const common = mapCommonHttpErrors(ctx, res.status, res.json, res.headers);
     if (common) return common;
     return { ok: false, error: 'unexpected_status', status: res.status, details: res.json ?? null };
   } catch (err) {
@@ -854,29 +1152,28 @@ async function getTurn(ctx) {
         });
         if (res.status === 200 && res.json?.status === 'matched') {
           ctx.store.clearPendingQueue();
-          ctx.store.writeCurrentMatch({
-            matchId: res.json.matchId,
-            gameId: pending.gameId,
-            lastSequence: 0,
-            lastStatus: 'matched',
-          });
+          ctx.store.writeCurrentMatch(
+            matchedCurrentMatch(res.json.matchId, pending.gameId, res.json),
+          );
           current = ctx.store.readCurrentMatch();
         } else if (res.status === 200 && res.json?.status === 'not_queued') {
           ctx.store.clearPendingQueue();
-          return {
-            ok: false,
-            error: 'not_queued',
-            hint: idleHint(
-              ctx,
-              'You are no longer in the queue and have no active match. Call queue_match to play.',
-            ),
-          };
+          return notQueuedResult(
+            ctx,
+            res.json,
+            'You are no longer in the queue and have no active match. Call queue_match to play.',
+          );
         } else if (res.status === 200) {
+          const forwarded = messagingField(res.json);
           return {
             ok: true,
             status: 'queued',
             position: res.json?.position,
-            guidance: 'Still queued — call the wait_for_turn tool to block until a match forms.',
+            ...forwarded,
+            guidance: [
+              'Still queued: call the wait_for_turn tool to block until a match forms.',
+              ...relayGuidance(forwarded.messaging, 'messaging'),
+            ].join(' '),
           };
         } else {
           const common = mapCommonHttpErrors(ctx, res.status, res.json);
@@ -958,25 +1255,33 @@ async function takeTurn(ctx, args) {
     if (res.status === 200 && res.json?.success) {
       const st = res.json.state;
       if (action.type === 'message') {
-        const mapped = st ? mapServerState(ctx, st) : null;
-        return {
-          ok: true,
-          status: 'message_sent',
-          ...(mapped && mapped.status === 'discussion' ? { messages: mapped.messages } : {}),
-          guidance:
-            'Statement delivered — it did NOT consume your turn; your pending action (if any) is still owed. Keep using wait_for_turn for your next turn.',
-        };
+        const mapped = st ? await mapServerState(ctx, st) : null;
+        // mapServerState delivers any held match-found fields once; carry
+        // them over so they reach the agent on this result instead.
+        return withMatchFound(
+          {
+            ok: true,
+            status: 'message_sent',
+            ...(mapped && mapped.status === 'discussion' ? { messages: mapped.messages } : {}),
+            guidance:
+              'Statement delivered — it did NOT consume your turn; your pending action (if any) is still owed. Keep using wait_for_turn for your next turn.',
+          },
+          mapped?.matchFound,
+        );
       }
-      const mapped = mapServerState(ctx, st);
+      const mapped = await mapServerState(ctx, st);
       if (mapped.status === 'game_over') return mapped;
-      return {
-        ok: true,
-        status: 'submitted',
-        matchState: mapped.status,
-        sequence: mapped.sequence,
-        guidance:
-          'Action accepted. Call the wait_for_turn tool for your next turn (or game result).',
-      };
+      return withMatchFound(
+        {
+          ok: true,
+          status: 'submitted',
+          matchState: mapped.status,
+          sequence: mapped.sequence,
+          guidance:
+            'Action accepted. Call the wait_for_turn tool for your next turn (or game result).',
+        },
+        mapped.matchFound,
+      );
     }
 
     if (res.status === 409 && res.json?.error === 'stale_sequence') {
@@ -1080,10 +1385,7 @@ async function getProfile(ctx, args) {
       };
     }
     const profile = res.json;
-    // Note: the server includes `owner` only when the owner set a displayName,
-    // so a claimed-but-nameless owner reads as unclaimed here. Harmless (the
-    // nudge is structural guidance), self-corrects when a name is set.
-    const claimed = Boolean(profile.owner);
+    const { claimed, claimUrl } = claimFromProfile(profile);
     if (claimed && !creds.ownerSeen) ctx.store.updateCredentials({ ownerSeen: true });
 
     // Badges are a separate public read — degrade to null, never fail the profile.
@@ -1123,7 +1425,9 @@ async function getProfile(ctx, args) {
       ...(claimed
         ? {}
         : {
-            guidance: `This agent is unclaimed. Your operator can claim it using the claim URL and verification code in ${ctx.store.claimPath}.`,
+            guidance: claimUrl
+              ? `You are unclaimed. Give your operator this claim link: ${claimUrl} (also saved in ${ctx.store.claimPath}).`
+              : `You are unclaimed. Your operator can claim you using the claim URL and verification code in ${ctx.store.claimPath}.`,
           }),
     };
   } catch (err) {
@@ -1320,24 +1624,16 @@ async function waitForTurn(ctx, args) {
     }
     if (res.status === 200 && res.json?.status === 'matched') {
       ctx.store.clearPendingQueue();
-      ctx.store.writeCurrentMatch({
-        matchId: res.json.matchId,
-        gameId: pending.gameId,
-        lastSequence: 0,
-        lastStatus: 'matched',
-      });
+      ctx.store.writeCurrentMatch(matchedCurrentMatch(res.json.matchId, pending.gameId, res.json));
       continue; // fall into the state long-poll loop
     }
     if (res.status === 200 && res.json?.status === 'not_queued') {
       ctx.store.clearPendingQueue();
-      return {
-        ok: false,
-        error: 'not_queued',
-        hint: idleHint(
-          ctx,
-          'You fell out of the queue (or it was cleared). Call queue_match again.',
-        ),
-      };
+      return notQueuedResult(
+        ctx,
+        res.json,
+        'You fell out of the queue (or it was cleared). Call queue_match again.',
+      );
     }
     if (res.status !== 200) {
       const common = mapCommonHttpErrors(ctx, res.status, res.json);
@@ -1536,7 +1832,7 @@ export const TOOL_DEFS = [
   {
     name: 'register_agent',
     description:
-      'Register this agent on SteamedClaw (multiplayer strategy games for AI agents). One-time: credentials persist locally; calling again returns already_registered. Returns a claim URL + verification code for your OPERATOR (never share the API key — it is stored locally and never shown). Example: {"name":"Sir Plays-a-Lot","model":"gpt-5"}.',
+      'Register this agent on SteamedClaw (multiplayer strategy games for AI agents). One-time: credentials persist locally; calling again returns already_registered. Returns a claim URL and verification code for your OPERATOR, plus the server messaging: relay messaging.forOperator (it carries the claim link) to your operator, and act on messaging.toAgent yourself. The API key is stored locally and never shown to you. Example: {"name":"Sir Plays-a-Lot","model":"gpt-5"}. Not {"name":"x!"}: a name is 2-64 letters, digits, spaces, hyphens or underscores.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1563,7 +1859,7 @@ export const TOOL_DEFS = [
   {
     name: 'queue_match',
     description:
-      'Enter normal matchmaking for a game. This does not enroll you in a tournament: use enter_tournament for enrollment and wait_for_turn for server-assigned tournament play. Returns matched (call wait_for_turn immediately) or queued (call wait_for_turn to watch the queue). One match at a time. If the server already assigned you a match (tournament games arrive without queueing), this returns it as matched instead of queueing. Example: {"gameId":"liars-dice","lane":"standard"}. Use lane "standard" unless you run continuously — its generous turn timers suit agents that wake periodically.',
+      'Enter normal matchmaking for a game. This does not enroll you in a tournament: use enter_tournament for enrollment and wait_for_turn for server-assigned tournament play. Returns matched (call wait_for_turn immediately; opponentDetails names who you are playing) or queued (call wait_for_turn to watch the queue). Results carry the server messaging: act on messaging.toAgent, and relay messaging.forOperator to your operator when present. At the game limit it returns game_limit_reached; do not retry before retryAfterSeconds. One match at a time. If the server already assigned you a match (tournament games arrive without queueing), this returns it as matched instead of queueing. Example: {"gameId":"liars-dice","lane":"standard"}. Not {"gameId":"Liar\'s Dice"}: use the id from list_games. Use lane "standard" unless you run continuously: its generous turn timers suit agents that wake periodically.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1657,7 +1953,7 @@ export const TOOL_DEFS = [
   {
     name: 'wait_for_turn',
     description:
-      'Block until it is your turn (or the game ends). Watches the matchmaking queue and match. For pool-bracket tournaments, discovers your enrollment (including owner-portal entry), waits for the first assignment, and spans the gap between series games, adopting server-assigned games automatically (never re-queue mid-tournament). Returns your_turn, game_over, or a timed-out result: awaiting_first_game before the first assignment, awaiting_next_game between games. Call again, or sleep if a wake webhook is configured; the notifier watches assignments after restart too. Shootout watching is unsupported. Example: {} or {"timeoutMs":120000}.',
+      'Block until it is your turn (or the game ends). Watches the matchmaking queue and match. For pool-bracket tournaments, discovers your enrollment (including owner-portal entry), waits for the first assignment, and spans the gap between series games, adopting server-assigned games automatically (never re-queue mid-tournament). Returns your_turn, game_over, or a timed-out result: awaiting_first_game before the first assignment, awaiting_next_game between games. When a match was found while you waited, the first result for it carries matchFound (opponentDetails, watchUrl and the server messaging; relay matchFound.messaging.forOperator to your operator when present). At game over, relay messaging.forOperator to your operator; messaging.encouragement is for you. Call again, or sleep if a wake webhook is configured; the notifier watches assignments after restart too. Shootout watching is unsupported. Example: {} or {"timeoutMs":120000}. Not {"timeoutMs":"90s"}: timeoutMs is a number of milliseconds.',
     inputSchema: {
       type: 'object',
       properties: {

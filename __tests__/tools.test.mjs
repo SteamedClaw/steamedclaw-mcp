@@ -79,6 +79,7 @@ const GAME_OVER_ENVELOPE = {
   shareText: 'TestBot won a nail-biter on SteamedClaw!',
   replayUrl: 'https://steamedclaw.com/api/matches/m-1',
   replayMarkdownUrl: 'https://steamedclaw.com/api/matches/m-1?format=md',
+  matchUrl: 'https://steamedclaw.com/matches/m-1',
   messaging: { teaser: 'server teaser text', encouragement: 'server encouragement text' },
 };
 
@@ -190,6 +191,101 @@ describe('queue_match / leave_queue', () => {
     assert.equal(ctx2.store.readPendingQueue().gameId, 'nim');
   });
 
+  test('429 game_limit_reached surfaces the server message, claimUrl and real wait verbatim', async () => {
+    const ctx = makeCtx();
+    const serverMessage =
+      'Game limit reached: unclaimed agents may play 10 games per rolling 24h. Have your operator claim your agent at https://steamedclaw.com/claim?agent=agent-1&code=v-1 to raise your limit to 50 games per 24h.';
+    let calls = 0;
+    routes['POST /api/matchmaking/queue'] = (req, res) => {
+      calls += 1;
+      res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '3600' });
+      res.end(
+        JSON.stringify({
+          error: 'game_limit_reached',
+          message: serverMessage,
+          limit: 10,
+          windowHours: 24,
+          retryAfterSeconds: 3600,
+          claimUrl: 'https://steamedclaw.com/claim?agent=agent-1&code=v-1',
+        }),
+      );
+    };
+    const out = await dispatchTool('queue_match', { gameId: 'nim' }, ctx);
+    assert.equal(out.ok, false);
+    assert.equal(out.error, 'game_limit_reached');
+    assert.equal(out.message, serverMessage); // server-authored, byte-identical
+    assert.equal(out.claimUrl, 'https://steamedclaw.com/claim?agent=agent-1&code=v-1');
+    assert.equal(out.retryAfterSeconds, 3600);
+    assert.equal(out.limit, 10);
+    assert.equal(out.windowHours, 24);
+    // Not the generic rate-limit shape: no ~1s retry, no polling advice.
+    assert.equal('retryAfterMs' in out, false);
+    assert.doesNotMatch(out.hint, /wait_for_turn/);
+    assert.match(out.hint, /retryAfterSeconds/);
+    // The server message is written to the agent ("Have your operator claim
+    // your agent…"), so the hint must not ask for it to be relayed verbatim.
+    assert.doesNotMatch(out.hint, /VERBATIM/);
+    assert.match(out.hint, /Tell your operator .*claimUrl/);
+    // An hour-long wait is never retried client-side, and nothing was queued.
+    assert.equal(calls, 1);
+    assert.equal(ctx.store.readPendingQueue(), null);
+  });
+
+  test('429 game_limit_reached for a claimed agent carries no claimUrl', async () => {
+    const ctx = makeCtx();
+    const serverMessage =
+      'Game limit reached: 50 games per rolling 24h. A slot opens when your oldest game leaves the window — see Retry-After.';
+    routes['POST /api/matchmaking/queue'] = (req, res) => {
+      res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '900' });
+      res.end(
+        JSON.stringify({
+          error: 'game_limit_reached',
+          message: serverMessage,
+          limit: 50,
+          windowHours: 24,
+          retryAfterSeconds: 900,
+        }),
+      );
+    };
+    const out = await dispatchTool('queue_match', { gameId: 'nim' }, ctx);
+    assert.equal(out.error, 'game_limit_reached');
+    assert.equal(out.message, serverMessage);
+    assert.equal(out.retryAfterSeconds, 900);
+    assert.equal('claimUrl' in out, false);
+    assert.doesNotMatch(out.hint, /claimUrl/);
+  });
+
+  test('429 game_limit_reached without retryAfterSeconds in the body falls back to Retry-After', async () => {
+    const ctx = makeCtx();
+    routes['POST /api/matchmaking/queue'] = (req, res) => {
+      res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '1200' });
+      res.end(JSON.stringify({ error: 'game_limit_reached', message: 'limit' }));
+    };
+    const out = await dispatchTool('queue_match', { gameId: 'nim' }, ctx);
+    assert.equal(out.error, 'game_limit_reached');
+    assert.equal(out.retryAfterSeconds, 1200);
+    assert.equal('limit' in out, false); // absent stays absent
+
+    // With no wait anywhere, the hint never points at a missing field.
+    routes['POST /api/matchmaking/queue'] = (req, res) =>
+      respond(res, 429, { error: 'game_limit_reached' });
+    const bare = await dispatchTool('queue_match', { gameId: 'nim' }, ctx);
+    assert.equal(bare.error, 'game_limit_reached');
+    assert.equal('retryAfterSeconds' in bare, false);
+    assert.equal('message' in bare, false);
+    assert.doesNotMatch(bare.hint, /retryAfterSeconds|VERBATIM/);
+  });
+
+  test('an ordinary 429 on queue_match keeps the rate_limited shape', async () => {
+    const ctx = makeCtx();
+    routes['POST /api/matchmaking/queue'] = (req, res) =>
+      respond(res, 429, { error: 'rate_limited', retryAfterMs: 1 });
+    const out = await dispatchTool('queue_match', { gameId: 'nim' }, ctx);
+    assert.equal(out.error, 'rate_limited');
+    assert.equal(out.retryAfterMs, 1);
+    assert.match(out.hint, /wait_for_turn/);
+  });
+
   test('refuses a second simultaneous match', async () => {
     const ctx = makeCtx();
     ctx.store.writeCurrentMatch({ matchId: 'm-1', gameId: 'nim', lastSequence: 2 });
@@ -282,6 +378,7 @@ describe('get_turn state mapping', () => {
     assert.equal(out.shareText, GAME_OVER_ENVELOPE.shareText);
     assert.equal(out.replayUrl, GAME_OVER_ENVELOPE.replayUrl);
     assert.equal(out.replayMarkdownUrl, GAME_OVER_ENVELOPE.replayMarkdownUrl);
+    assert.equal(out.matchUrl, GAME_OVER_ENVELOPE.matchUrl); // portal page for the human
     assert.deepEqual(out.messaging, GAME_OVER_ENVELOPE.messaging); // ONE opaque object
     assert.match(out.guidance, /VERBATIM/);
     // Active slot cleared; last completed remembered for replay/reflection.
@@ -345,6 +442,107 @@ describe('get_turn state mapping', () => {
     ctx2.store.writeCurrentMatch({ matchId: 'm-1', gameId: 'tic-tac-toe', lastSequence: 8 });
     const out2 = await dispatchTool('get_turn', {}, ctx2);
     assert.doesNotMatch(out2.guidance ?? '', /UNCLAIMED/);
+  });
+
+  test('game_over asks the server before nudging: a claimed agent that never called get_profile is not nagged', async () => {
+    const ctx = makeCtx();
+    ctx.store.writeClaimFileOnce({
+      agentId: 'agent-1',
+      name: 'TestBot',
+      claimUrl: 'https://steamedclaw.com/claim?agent=agent-1',
+      verificationCode: 'v-1',
+    });
+    ctx.store.writeCurrentMatch({ matchId: 'm-1', gameId: 'tic-tac-toe', lastSequence: 8 });
+    routes['GET /api/matches/m-1/state'] = (req, res) => respond(res, 200, GAME_OVER_ENVELOPE);
+    let meCalls = 0;
+    routes['GET /api/agents/me'] = (req, res) => {
+      meCalls += 1;
+      // Claimed by an owner with no display name: no `owner` field.
+      respond(res, 200, { id: 'agent-1', claim: { claimed: true, claimUrl: null } });
+    };
+    const out = await dispatchTool('get_turn', {}, ctx);
+    assert.equal(out.status, 'game_over');
+    assert.doesNotMatch(out.guidance, /UNCLAIMED/);
+    assert.equal(ctx.store.readCredentials().ownerSeen, true);
+    assert.equal(meCalls, 1);
+
+    // Once claimed is known, later game-overs do not re-ask the server.
+    ctx.store.writeCurrentMatch({ matchId: 'm-1', gameId: 'tic-tac-toe', lastSequence: 8 });
+    const again = await dispatchTool('get_turn', {}, ctx);
+    assert.doesNotMatch(again.guidance, /UNCLAIMED/);
+    assert.equal(meCalls, 1);
+  });
+
+  test('game_over nudge for a server-confirmed unclaimed agent carries the server claim link', async () => {
+    const ctx = makeCtx();
+    ctx.store.writeClaimFileOnce({
+      agentId: 'agent-1',
+      name: 'TestBot',
+      claimUrl: 'https://steamedclaw.com/claim?agent=agent-1&code=v-1',
+      verificationCode: 'v-1',
+    });
+    ctx.store.writeCurrentMatch({ matchId: 'm-1', gameId: 'tic-tac-toe', lastSequence: 8 });
+    routes['GET /api/matches/m-1/state'] = (req, res) => respond(res, 200, GAME_OVER_ENVELOPE);
+    routes['GET /api/agents/me'] = (req, res) =>
+      respond(res, 200, {
+        id: 'agent-1',
+        claim: { claimed: false, claimUrl: 'https://steamedclaw.com/claim?agent=agent-1&code=v-2' },
+      });
+    const out = await dispatchTool('get_turn', {}, ctx);
+    assert.match(out.guidance, /UNCLAIMED/);
+    assert.match(out.guidance, /claim\?agent=agent-1&code=v-2/);
+    assert.equal(ctx.store.readCredentials().ownerSeen, undefined);
+  });
+
+  test('game_over claim read on an older server (no claim block) falls back to owner', async () => {
+    const claimed = makeCtx();
+    claimed.store.writeClaimFileOnce({
+      agentId: 'agent-1',
+      name: 'TestBot',
+      claimUrl: 'u',
+      verificationCode: 'v',
+    });
+    claimed.store.writeCurrentMatch({ matchId: 'm-1', gameId: 'tic-tac-toe', lastSequence: 8 });
+    routes['GET /api/matches/m-1/state'] = (req, res) => respond(res, 200, GAME_OVER_ENVELOPE);
+    routes['GET /api/agents/me'] = (req, res) =>
+      respond(res, 200, { id: 'agent-1', owner: { displayName: 'Owner' } });
+    const out = await dispatchTool('get_turn', {}, claimed);
+    assert.doesNotMatch(out.guidance, /UNCLAIMED/);
+    assert.equal(claimed.store.readCredentials().ownerSeen, true);
+
+    const unclaimed = makeCtx();
+    unclaimed.store.writeClaimFileOnce({
+      agentId: 'agent-1',
+      name: 'TestBot',
+      claimUrl: 'u',
+      verificationCode: 'v',
+    });
+    unclaimed.store.writeCurrentMatch({ matchId: 'm-1', gameId: 'tic-tac-toe', lastSequence: 8 });
+    routes['GET /api/agents/me'] = (req, res) => respond(res, 200, { id: 'agent-1' });
+    const out2 = await dispatchTool('get_turn', {}, unclaimed);
+    assert.match(out2.guidance, /UNCLAIMED/);
+    assert.ok(out2.guidance.includes(unclaimed.store.claimPath));
+  });
+
+  test('a network failure on the game_over claim read keeps the claim.md nudge and still delivers', async () => {
+    const ctx = makeCtx();
+    ctx.store.writeClaimFileOnce({
+      agentId: 'agent-1',
+      name: 'TestBot',
+      claimUrl: 'u',
+      verificationCode: 'v',
+    });
+    ctx.store.writeCurrentMatch({ matchId: 'm-1', gameId: 'tic-tac-toe', lastSequence: 8 });
+    routes['GET /api/matches/m-1/state'] = (req, res) => respond(res, 200, GAME_OVER_ENVELOPE);
+    ctx.fetchImpl = (url, opts) =>
+      new URL(url).pathname === '/api/agents/me'
+        ? Promise.reject(new TypeError('fetch failed'))
+        : fetch(url, opts);
+    const out = await dispatchTool('get_turn', {}, ctx);
+    assert.equal(out.status, 'game_over');
+    assert.match(out.guidance, /UNCLAIMED/);
+    assert.ok(out.guidance.includes(ctx.store.claimPath));
+    assert.equal(ctx.store.readCurrentMatch(), null);
   });
 
   test('404 clears the stale current match', async () => {
@@ -432,6 +630,7 @@ describe('take_turn', () => {
     assert.equal(out.status, 'game_over');
     assert.deepEqual(out.messaging, GAME_OVER_ENVELOPE.messaging);
     assert.equal(out.shareText, GAME_OVER_ENVELOPE.shareText);
+    assert.equal(out.matchUrl, GAME_OVER_ENVELOPE.matchUrl);
   });
 
   test('409 stale_sequence updates the local cursor and hints a refresh', async () => {
@@ -656,6 +855,49 @@ describe('get_profile', () => {
     const out2 = await dispatchTool('get_profile', {}, ctx);
     assert.equal(out2.claimStatus, 'claimed');
     assert.equal(ctx.store.readCredentials().ownerSeen, true);
+  });
+
+  test('claim.claimed is the source of truth: claimed with no owner display name reads claimed', async () => {
+    const ctx = makeCtx();
+    routes['GET /api/agents/me'] = (req, res) =>
+      respond(res, 200, {
+        id: 'agent-1',
+        name: 'TestBot',
+        ratings: {},
+        reliability: {},
+        claim: { claimed: true, claimUrl: null },
+      });
+    const out = await dispatchTool('get_profile', {}, ctx);
+    assert.equal(out.claimStatus, 'claimed');
+    assert.equal('guidance' in out, false);
+    assert.equal(ctx.store.readCredentials().ownerSeen, true);
+    assert.deepEqual(out.profile.claim, { claimed: true, claimUrl: null }); // forwarded verbatim
+  });
+
+  test('claim.claimed=false gives the server claim link in the guidance', async () => {
+    const ctx = makeCtx();
+    const claimUrl = 'https://steamedclaw.com/claim?agent=agent-1&code=v-1';
+    routes['GET /api/agents/me'] = (req, res) =>
+      respond(res, 200, {
+        id: 'agent-1',
+        name: 'TestBot',
+        ratings: {},
+        reliability: {},
+        claim: { claimed: false, claimUrl },
+      });
+    const out = await dispatchTool('get_profile', {}, ctx);
+    assert.equal(out.claimStatus, 'unclaimed');
+    assert.ok(out.guidance.includes(claimUrl));
+    assert.equal(ctx.store.readCredentials().ownerSeen, undefined);
+  });
+
+  test('claim.claimed=false with no claim link keeps the claim.md guidance', async () => {
+    const ctx = makeCtx();
+    routes['GET /api/agents/me'] = (req, res) =>
+      respond(res, 200, { id: 'agent-1', claim: { claimed: false, claimUrl: null } });
+    const out = await dispatchTool('get_profile', {}, ctx);
+    assert.equal(out.claimStatus, 'unclaimed');
+    assert.ok(out.guidance.includes(ctx.store.claimPath));
   });
 
   test('optional leaderboard fetch', async () => {
