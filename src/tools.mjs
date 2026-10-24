@@ -33,6 +33,7 @@ import {
   retryAfterHeaderMs,
 } from './http-client.mjs';
 import { TOURNAMENT_TOOL_DEFS, tournamentRequest } from './tournament-tools.mjs';
+import { apiBaseUrl } from './state.mjs';
 import {
   recordEnrollment,
   refreshEnrollmentWatches,
@@ -330,7 +331,7 @@ async function discoverAssignedMatch(ctx, creds) {
   }
   const res = await apiRequest({
     path: `/api/agents/${encodeURIComponent(creds.agentId)}/matches`,
-    baseUrl: creds.server,
+    baseUrl: apiBaseUrl(ctx, creds),
     apiKey: creds.apiKey,
     query: { limit: DISCOVERY_MATCH_LIST_LIMIT },
     fetchImpl: ctx.fetchImpl,
@@ -537,7 +538,7 @@ async function resolveClaimNudge(ctx) {
   try {
     const res = await apiRequest({
       path: '/api/agents/me',
-      baseUrl: creds.server,
+      baseUrl: apiBaseUrl(ctx, creds),
       apiKey: creds.apiKey,
       timeoutMs: CLAIM_CHECK_TIMEOUT_MS,
       retryOn429: false,
@@ -735,7 +736,7 @@ async function mapServerState(ctx, st) {
 async function fetchState(ctx, creds, matchId, { wait = false, afterSequence, timeoutMs } = {}) {
   return apiRequest({
     path: `/api/matches/${encodeURIComponent(matchId)}/state`,
-    baseUrl: creds.server,
+    baseUrl: apiBaseUrl(ctx, creds),
     apiKey: creds.apiKey,
     query: wait
       ? { wait: 'true', ...(afterSequence !== undefined ? { afterSequence } : {}) }
@@ -924,7 +925,7 @@ async function tournamentTool(name, ctx, args) {
   try {
     const res = await apiRequest({
       ...request,
-      baseUrl: creds?.server ?? ctx.cfg.baseUrl,
+      baseUrl: apiBaseUrl(ctx, creds),
       apiKey: request.auth ? creds.apiKey : null,
       fetchImpl: ctx.fetchImpl,
     });
@@ -1013,7 +1014,7 @@ async function queueMatch(ctx, args) {
     const res = await apiRequest({
       method: 'POST',
       path: '/api/matchmaking/queue',
-      baseUrl: creds.server,
+      baseUrl: apiBaseUrl(ctx, creds),
       apiKey: creds.apiKey,
       body: { gameId, ...(lane ? { lane } : {}) },
       fetchImpl: ctx.fetchImpl,
@@ -1083,7 +1084,7 @@ async function leaveQueue(ctx, args) {
     const res = await apiRequest({
       method: 'DELETE',
       path: '/api/matchmaking/queue',
-      baseUrl: creds.server,
+      baseUrl: apiBaseUrl(ctx, creds),
       apiKey: creds.apiKey,
       query: {
         ...(typeof args?.gameId === 'string' && args.gameId ? { gameId: args.gameId } : {}),
@@ -1145,7 +1146,7 @@ async function getTurn(ctx) {
       try {
         const res = await apiRequest({
           path: '/api/matchmaking/status',
-          baseUrl: creds.server,
+          baseUrl: apiBaseUrl(ctx, creds),
           apiKey: creds.apiKey,
           query: { gameId: pending.gameId },
           fetchImpl: ctx.fetchImpl,
@@ -1243,7 +1244,7 @@ async function takeTurn(ctx, args) {
     const res = await apiRequest({
       method: 'POST',
       path: `/api/matches/${encodeURIComponent(current.matchId)}/action`,
-      baseUrl: creds.server,
+      baseUrl: apiBaseUrl(ctx, creds),
       apiKey: creds.apiKey,
       body: { sequence: current.lastSequence ?? 0, action },
       // A sequential action can end the match; the server waits for the
@@ -1370,7 +1371,7 @@ async function getProfile(ctx, args) {
   try {
     const res = await apiRequest({
       path: '/api/agents/me',
-      baseUrl: creds.server,
+      baseUrl: apiBaseUrl(ctx, creds),
       apiKey: creds.apiKey,
       fetchImpl: ctx.fetchImpl,
     });
@@ -1393,7 +1394,7 @@ async function getProfile(ctx, args) {
     try {
       const badgeRes = await apiRequest({
         path: `/api/agents/${encodeURIComponent(creds.agentId)}/badges`,
-        baseUrl: creds.server,
+        baseUrl: apiBaseUrl(ctx, creds),
         fetchImpl: ctx.fetchImpl,
       });
       if (badgeRes.status === 200 && Array.isArray(badgeRes.json?.badges)) {
@@ -1408,7 +1409,7 @@ async function getProfile(ctx, args) {
     if (typeof lbGame === 'string' && lbGame !== '') {
       const lb = await apiRequest({
         path: `/api/leaderboards/${encodeURIComponent(lbGame)}`,
-        baseUrl: creds.server,
+        baseUrl: apiBaseUrl(ctx, creds),
         apiKey: creds.apiKey,
         fetchImpl: ctx.fetchImpl,
       });
@@ -1613,7 +1614,7 @@ async function waitForTurn(ctx, args) {
     try {
       res = await apiRequest({
         path: '/api/matchmaking/status',
-        baseUrl: creds.server,
+        baseUrl: apiBaseUrl(ctx, creds),
         apiKey: creds.apiKey,
         query: { gameId: pending.gameId },
         fetchImpl: ctx.fetchImpl,
@@ -1719,7 +1720,7 @@ async function replayMatch(ctx, args) {
   try {
     const res = await apiRequest({
       path: `/api/matches/${encodeURIComponent(matchId)}/events`,
-      baseUrl: creds.server,
+      baseUrl: apiBaseUrl(ctx, creds),
       apiKey: creds.apiKey,
       fetchImpl: ctx.fetchImpl,
     });

@@ -2,6 +2,7 @@
 // The server remains authoritative for enrollment, format and lifecycle. Only
 // pool-bracket is supported; no owner credentials or owner endpoints are used.
 import { apiRequest, NetworkError, log } from './http-client.mjs';
+import { apiBaseUrl } from './state.mjs';
 import { DISCOVERY_POLL_INTERVAL_MS, WAKE_IDLE_DISCOVERY_INTERVAL_MS } from './config.mjs';
 
 const LIVE_STATUSES = new Set(['announced', 'registration', 'qualifying', 'seeding', 'bracket']);
@@ -87,7 +88,7 @@ export function refreshEnrollmentWatches(ctx, creds, { force = false, timeoutMs 
       if (remaining <= 0) throw new NetworkError('Enrollment scan budget expired');
       return apiRequest({
         path,
-        baseUrl: creds.server,
+        baseUrl: apiBaseUrl(ctx, creds),
         apiKey: auth ? creds.apiKey : null,
         fetchImpl: ctx.fetchImpl,
         timeoutMs: remaining,

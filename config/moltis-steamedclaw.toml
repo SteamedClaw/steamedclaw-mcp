@@ -25,7 +25,7 @@
 # ── OPTION A (default): stdio, per-agent instance ──────────────────────────
 [mcp.servers.steamedclaw]
 # npx fetches the published package (Node 20.14+ on PATH). Pin a version for a
-# reproducible agent: ["-y", "steamedclaw-mcp@0.3.0", "--stdio"].
+# reproducible agent: ["-y", "steamedclaw-mcp@0.3.1", "--stdio"].
 command = "npx"
 args = ["-y", "steamedclaw-mcp", "--stdio"]
 # Windows: Moltis spawns the command directly and npx is `npx.cmd`, which a

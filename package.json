@@ -1,6 +1,6 @@
 {
   "name": "steamedclaw-mcp",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Local single-tenant SteamedClaw MCP server for MCP-native agent runtimes (Hermes, Moltis, NanoClaw). One process per agent; HTTP-only client of the SteamedClaw public API; streamable-HTTP MCP transport plus --stdio mode; optional webhook wake-notifier for event-driven play.",
   "type": "module",
   "main": "index.mjs",

@@ -6,7 +6,9 @@
 // NTFS — documented in the README).
 //
 // Files under the state dir:
-//   credentials.json   {server, agentId, apiKey, name, registeredAt, ownerSeen?}
+//   credentials.json   {server?, agentId, apiKey, name, registeredAt, ownerSeen?}
+//                      server: the API base URL the identity is bound to;
+//                      absent or blank means the configured one (apiBaseUrl)
 //   current-match.json {matchId, gameId, lastSequence, lastStatus, lastMessageCount?,
 //                      matchFound?, updatedAt}
 //                      matchFound: the match-found fields of a matchmaking
@@ -39,6 +41,51 @@ export function writeJsonAtomic(filePath, value) {
   fs.renameSync(tmp, filePath);
 }
 
+/**
+ * The API base URL for an identity's requests: the one place that reads the
+ * stored `server` field. A stored value wins, so an identity stays bound to
+ * the server it registered on. A missing, null or blank value (a migrated or
+ * hand-seeded credentials file; register_agent always writes the field) falls
+ * back to the configured base URL. A present value that cannot serve as a
+ * base URL throws a message naming the field instead of a bare "Invalid URL".
+ * The value itself is never echoed: a hand-written one may carry a password.
+ */
+export function apiBaseUrl(ctx, creds) {
+  const stored = creds?.server;
+  if (stored === undefined || stored === null) return ctx.cfg.baseUrl;
+  if (typeof stored === 'string') {
+    // Request URLs are built as base + path, so surrounding whitespace or a
+    // trailing slash in a hand-written value would break every request.
+    const trimmed = stored.trim().replace(/\/+$/, '');
+    if (trimmed === '') return ctx.cfg.baseUrl;
+    let url = null;
+    try {
+      url = new URL(trimmed);
+    } catch {
+      // not parseable; reported below
+    }
+    // A query, fragment or user:password part would swallow the request
+    // path or make fetch refuse the request, so those count as unusable too.
+    if (
+      url &&
+      (url.protocol === 'http:' || url.protocol === 'https:') &&
+      !url.username &&
+      !url.password &&
+      !url.search &&
+      !url.hash
+    ) {
+      return trimmed;
+    }
+  }
+  const file = ctx.store?.credentialsPath ?? 'credentials.json';
+  throw new Error(
+    `The server field in credentials.json is not a usable http(s) base URL. ` +
+      `Set the server field in ${file} to the address of the SteamedClaw server you registered on, ` +
+      `or remove the field to use the configured STEAMEDCLAW_BASE_URL (${ctx.cfg.baseUrl}). ` +
+      `If you cannot edit that file, pass this message to your operator.`,
+  );
+}
+
 function readJson(filePath) {
   try {
     return JSON.parse(fs.readFileSync(filePath, 'utf8'));
@@ -61,6 +108,9 @@ export function makeStateStore(stateDir) {
     stateDir,
 
     // --- credentials ---
+    get credentialsPath() {
+      return credsPath;
+    },
     readCredentials() {
       const c = readJson(credsPath);
       if (!c || typeof c.apiKey !== 'string' || typeof c.agentId !== 'string') return null;

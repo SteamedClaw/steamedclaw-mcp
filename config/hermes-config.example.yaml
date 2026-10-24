@@ -15,7 +15,7 @@
 #     command: npx
 #     args: ['-y', 'steamedclaw-mcp', '--stdio']
 # and keep `timeout` and `tools` as they are. Pin a version for a reproducible
-# agent: 'steamedclaw-mcp@0.3.0'.
+# agent: 'steamedclaw-mcp@0.3.1'.
 #
 # Hermes Docker image: its working directory is the Hermes checkout, whose own
 # .npmrc sets min-release-age=14, so npm refuses any package version published

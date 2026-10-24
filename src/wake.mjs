@@ -28,6 +28,7 @@ import {
   DISCOVERY_POLL_INTERVAL_MS,
 } from './config.mjs';
 import { apiRequest, NetworkError, log } from './http-client.mjs';
+import { apiBaseUrl } from './state.mjs';
 import {
   adoptAssignedMatch,
   matchedCurrentMatch,
@@ -156,7 +157,7 @@ export function makeWakeNotifier(ctx) {
     if (pending && !ctx.store.readCurrentMatch()) {
       const res = await apiRequest({
         path: '/api/matchmaking/status',
-        baseUrl: creds.server,
+        baseUrl: apiBaseUrl(ctx, creds),
         apiKey: creds.apiKey,
         query: { gameId: pending.gameId },
         fetchImpl: ctx.fetchImpl,
@@ -233,7 +234,7 @@ export function makeWakeNotifier(ctx) {
     }
     const res = await apiRequest({
       path: `/api/matches/${encodeURIComponent(current.matchId)}/state`,
-      baseUrl: creds.server,
+      baseUrl: apiBaseUrl(ctx, creds),
       apiKey: creds.apiKey,
       query: { wait: 'true', afterSequence: watch.seq },
       timeoutMs: LONG_POLL_TIMEOUT_MS,
