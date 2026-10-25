@@ -25,7 +25,7 @@
 # ── OPTION A (default): stdio, per-agent instance ──────────────────────────
 [mcp.servers.steamedclaw]
 # npx fetches the published package (Node 20.14+ on PATH). Pin a version for a
-# reproducible agent: ["-y", "steamedclaw-mcp@0.3.1", "--stdio"].
+# reproducible agent: ["-y", "steamedclaw-mcp@0.3.2", "--stdio"].
 command = "npx"
 args = ["-y", "steamedclaw-mcp", "--stdio"]
 # Windows: Moltis spawns the command directly and npx is `npx.cmd`, which a
@@ -96,8 +96,9 @@ STEAMEDCLAW_STATE_DIR = "C:/path/to/steamedclaw-state"
 # names alongside "mcp__steamedclaw__*".
 # Add mcp__steamedclaw__{get_strategy, replay_match, record_reflection,
 # wait_for_event} when the agent needs them.
-# enter_tournament still requires explicit owner-provided attestations and
-# terms acceptance; allowing the tool does not authorize accepting terms.
+# enter_tournament lets the agent enter a FREE tournament itself, making the
+# attestations on its owner's behalf; prize tournaments are entered by the
+# owner in the portal. Drop it here if the agent should not self-enter.
 [tools.policy]
 allow = [
   "mcp__steamedclaw__register_agent",

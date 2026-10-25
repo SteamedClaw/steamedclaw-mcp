@@ -262,7 +262,7 @@ test('common auth, throttling, malformed response and network errors use existin
   assert.equal(offline.activity.inFlight, 0);
 });
 
-test('schemas advertise mandatory explicit acceptance and no owner/admin authority', () => {
+test('enter_tournament schema: required true attestations, no country, 13+ age, no owner/admin authority', () => {
   const def = TOOL_DEFS.find((tool) => tool.name === 'enter_tournament');
   assert.ok(def);
   assert.deepEqual(new Set(def.inputSchema.required), new Set(Object.keys(ENTRY)));
@@ -276,4 +276,40 @@ test('schemas advertise mandatory explicit acceptance and no owner/admin authori
   assert.equal(def.inputSchema.additionalProperties, false);
   assert.match(def.description, /prize/i);
   assert.match(def.description, /owner/i);
+});
+
+test('enter_tournament text matches the server: a free tournament is self-entered, no owner approval step', () => {
+  const def = TOOL_DEFS.find((tool) => tool.name === 'enter_tournament');
+  const props = def.inputSchema.properties;
+  const fields = ['single_entry_attestation', 'age_18_plus', 'rules_version_accepted'];
+  // The server lets an agent self-enter a FREE tournament and attest on its
+  // owner's behalf; only prize tournaments are owner-only. No text may send the
+  // agent off to ask for authorization first.
+  const approvalAsk =
+    /authori[sz]|approv(e|al) (from|by)|owner's (approval|permission|consent)|permission from|consent from|confirm with (your|the) owner|ask (your|the) owner|explicitly accepted by|explicit owner/i;
+  for (const text of [def.description, ...fields.map((key) => props[key].description)]) {
+    assert.doesNotMatch(text, approvalAsk);
+  }
+  assert.match(def.description, /on your owner's behalf/);
+  assert.match(def.description, /FREE tournament/);
+  // Kept: read first, prize = portal, server checks, enrollment is not matchmaking.
+  assert.match(def.description, /get_tournament and get_tournament_terms/);
+  assert.match(def.description, /portal/);
+  assert.match(def.description, /eligibility, claim and phone checks/);
+  assert.match(def.description, /get_my_tournament_schedule and wait_for_turn, never queue_match/);
+  // Literal example plus one negative for the likely mistake (guessing "latest").
+  // The example version must not be one a real tournament runs ("v1" is the
+  // backfilled version), or copying the example would skip reading the terms.
+  assert.match(def.description, /"rules_version_accepted":"v7"/);
+  assert.doesNotMatch(JSON.stringify(def), /"v1"|\\"v1\\"/);
+  assert.match(def.description, /Not \{"rules_version_accepted":"latest"\}/);
+  assert.match(def.description, /on that error, call get_tournament_terms again without version/);
+  assert.match(props.rules_version_accepted.description, /get_tournament_terms/);
+  assert.match(props.rules_version_accepted.description, /"latest"/);
+  assert.match(props.rules_version_accepted.description, /e\.g\. "v7"/);
+  // The current terms, not a superseded version read with the version argument.
+  assert.match(def.description, /get_tournament_terms returned when called without version/);
+  assert.match(props.rules_version_accepted.description, /when called without version/);
+  assert.match(props.single_entry_attestation.description, /on your owner's behalf/);
+  assert.match(props.age_18_plus.description, /on your owner's behalf/);
 });
