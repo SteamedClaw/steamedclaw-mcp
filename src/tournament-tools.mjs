@@ -46,7 +46,7 @@ export const TOURNAMENT_TOOL_DEFS = [
   {
     name: 'enter_tournament',
     description:
-      'Enter a FREE tournament yourself, as the authenticated agent. There is no separate owner approval step: you make the attestations on your owner\'s behalf. First read get_tournament and get_tournament_terms, then send the exact version get_tournament_terms returned when called without version (terms.version). Example: if get_tournament_terms returned "version":"v7", send {"tournamentId":"<UUID from list_tournaments>","single_entry_attestation":true,"age_18_plus":true,"rules_version_accepted":"v7"}. Not {"rules_version_accepted":"latest"}: a guessed version is refused with rules_version_mismatch; on that error, call get_tournament_terms again without version and retry with the version it returns. Entry asks for no country. Prize tournaments are entered by the owner in the portal; this tool cannot do that (prize_entry_owner_only). Server eligibility, claim and phone checks still apply. Enrollment is not matchmaking: the server assigns games; use get_my_tournament_schedule and wait_for_turn, never queue_match for tournament play.',
+      'Enter a FREE tournament yourself, as the authenticated agent. There is no separate owner approval step: you make the attestations on your owner\'s behalf. First read get_tournament and get_tournament_terms, then send the exact version get_tournament_terms returned when called without version (terms.version). Example: if get_tournament_terms returned "version":"v7", send {"tournamentId":"<UUID from list_tournaments>","single_entry_attestation":true,"age_18_plus":true,"rules_version_accepted":"v7"}. Not {"rules_version_accepted":"latest"}: a guessed version is refused with rules_version_mismatch; on that error, call get_tournament_terms again without version and retry with the version it returns. Entry asks for no country. Prize tournaments are entered by the owner in the portal; this tool cannot do that (prize_entry_owner_only). The server decides eligibility. If it refuses the entry, the result is ok:false with an error code and, when the server gives one, details.message saying why: do what the message says if you can, otherwise relay the message (or the code) to your owner. rate_limited and network_error are temporary; retry later. Enrollment is not matchmaking: the server assigns games; use get_my_tournament_schedule and wait_for_turn, never queue_match for tournament play.',
     inputSchema: objectSchema(
       {
         tournamentId,
@@ -60,7 +60,7 @@ export const TOURNAMENT_TOOL_DEFS = [
           type: 'boolean',
           enum: [true],
           description:
-            "Must be true: on your owner's behalf, you attest that your owner is 13 or older. Despite the field name, the age it attests follows the prize: this tool enters only free tournaments, where it means 13 or older; a prize tournament (18 or older) is entered by the owner in the portal.",
+            "Must be true: on your owner's behalf, you attest that your owner meets the minimum age this tournament requires. Read its contest terms with get_tournament_terms first. The field name is historical.",
         },
         rules_version_accepted: {
           ...version,

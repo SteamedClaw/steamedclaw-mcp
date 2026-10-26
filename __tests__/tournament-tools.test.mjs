@@ -225,7 +225,7 @@ test('server refusals retain status, code and owner guidance without retrying ac
   for (const [status, error] of [
     [400, 'attestation_required'],
     [403, 'prize_entry_owner_only'],
-    [403, 'phone_verification_required'],
+    [403, 'insufficient_match_activity'],
     [404, 'entry_not_found'],
     [409, 'rules_version_mismatch'],
     [409, 'tournament_field_full'],
@@ -240,6 +240,22 @@ test('server refusals retain status, code and owner guidance without retrying ac
     assert.equal(result.error, error);
     assert.equal(result.details.message, json.message);
     assert.doesNotMatch(JSON.stringify(result), new RegExp(KEY));
+    assert.equal(ctx.calls.length, 1);
+  }
+});
+
+test('a server refusal with no message still returns its code, status and details', async (t) => {
+  for (const [status, error] of [
+    [403, 'agent_not_claimed_for_tournament'],
+    [409, 'tournament_field_full'],
+  ]) {
+    const ctx = context(t, { status, json: { error } });
+    const result = await dispatchTool('enter_tournament', ENTRY, ctx);
+    assert.equal(result.ok, false);
+    assert.equal(result.status, status);
+    assert.equal(result.error, error);
+    assert.deepEqual(result.details, { error });
+    assert.equal(result.details.message, undefined);
     assert.equal(ctx.calls.length, 1);
   }
 });
@@ -262,16 +278,20 @@ test('common auth, throttling, malformed response and network errors use existin
   assert.equal(offline.activity.inFlight, 0);
 });
 
-test('enter_tournament schema: required true attestations, no country, 13+ age, no owner/admin authority', () => {
+test('enter_tournament schema: required true attestations, no country, age from the terms, no owner/admin authority', () => {
   const def = TOOL_DEFS.find((tool) => tool.name === 'enter_tournament');
   assert.ok(def);
   assert.deepEqual(new Set(def.inputSchema.required), new Set(Object.keys(ENTRY)));
   assert.deepEqual(def.inputSchema.properties.age_18_plus.enum, [true]);
-  // No country, and the age attestation states the free-tournament age.
+  // No country, and the age attestation points at the tournament with no
+  // number, without claiming the terms state the age.
   assert.equal(def.inputSchema.properties.jurisdiction, undefined);
   assert.doesNotMatch(JSON.stringify(def), /jurisdiction|country code/i);
-  assert.match(def.inputSchema.properties.age_18_plus.description, /13 or older/);
-  assert.doesNotMatch(def.inputSchema.properties.age_18_plus.description, /at least 18/);
+  const age = def.inputSchema.properties.age_18_plus.description;
+  assert.match(age, /meets the minimum age this tournament requires/);
+  assert.match(age, /get_tournament_terms/);
+  assert.match(age, /field name is historical/);
+  assert.doesNotMatch(age, /stated in|whatever the terms say/i);
   assert.deepEqual(def.inputSchema.properties.single_entry_attestation.enum, [true]);
   assert.equal(def.inputSchema.additionalProperties, false);
   assert.match(def.description, /prize/i);
@@ -292,10 +312,35 @@ test('enter_tournament text matches the server: a free tournament is self-entere
   }
   assert.match(def.description, /on your owner's behalf/);
   assert.match(def.description, /FREE tournament/);
-  // Kept: read first, prize = portal, server checks, enrollment is not matchmaking.
+  // Kept: read first, prize = portal, enrollment is not matchmaking.
   assert.match(def.description, /get_tournament and get_tournament_terms/);
   assert.match(def.description, /portal/);
-  assert.match(def.description, /eligibility, claim and phone checks/);
+  assert.match(def.description, /prize_entry_owner_only/);
+  // Eligibility is the server's: the static text names no rule (it would go
+  // stale when a rule moves) and says how a refusal reaches the agent instead.
+  assert.match(def.description, /The server decides eligibility/);
+  assert.match(def.description, /details\.message/);
+  assert.match(def.description, /relay/);
+  assert.doesNotMatch(JSON.stringify(def), /phone|social/i);
+  // Prose only (schema keywords such as `minimum` are not rule statements).
+  for (const text of [def.description, ...fields.map((key) => props[key].description)]) {
+    assert.doesNotMatch(
+      text,
+      /claim|activity|minimum(?! age\b)|at least \d+ match|registration window|field.cap|field is full/i,
+    );
+    // No age floor either: the age comes from the tournament's contest terms.
+    // (\b keeps the wire name age_18_plus out of the match.)
+    assert.doesNotMatch(text, /\b(13|18)\b|thirteen|eighteen|or older/i);
+    // Any other age floor too ("minimum age 16", "twenty-one"): no standalone
+    // number and no age-number word in the prose at all.
+    assert.doesNotMatch(
+      text,
+      /\b\d+\b|\b(sixteen|seventeen|nineteen|twenty|twenty-one)\b|or over|years? old|years of age/i,
+    );
+  }
+  // Temporary failures are retried, not escalated.
+  assert.match(def.description, /rate_limited and network_error are temporary; retry later/);
+  assert.match(def.description, /do what the message says if you can/);
   assert.match(def.description, /get_my_tournament_schedule and wait_for_turn, never queue_match/);
   // Literal example plus one negative for the likely mistake (guessing "latest").
   // The example version must not be one a real tournament runs ("v1" is the
