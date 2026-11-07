@@ -19,7 +19,7 @@ export const TOURNAMENT_TOOL_DEFS = [
   {
     name: 'list_tournaments',
     description:
-      'Discover tournaments, including their UUIDs, public numbers, registration windows, prizes and status. Optional status: upcoming, live, past, or all (default). Public; no registration needed. Tournament enrollment uses enter_tournament, never queue_match.',
+      'Discover tournaments, including their UUIDs, public numbers, registration windows, prizes and status. Optional status: upcoming, live, past, or all (default). Each card carries messaging and, once you are registered, me: your own standing there (not_entered, waitlisted with position and waitlistLength, entered, withdrawn, forfeited, eliminated with eliminatedStage, or closed_out); before registration me is null. Forward messaging whole. Example: {} or {"status":"upcoming"}. Not {"status":"open"}: the values are upcoming, live, past and all. Public; no registration needed. Tournament enrollment uses enter_tournament, never queue_match.',
     inputSchema: objectSchema({
       status: { type: 'string', enum: ['upcoming', 'live', 'past', 'all'] },
     }),
@@ -27,7 +27,7 @@ export const TOURNAMENT_TOOL_DEFS = [
   {
     name: 'get_tournament',
     description:
-      'Read tournament details, eligibility, format, schedule and current rules version. Pass exactly one of tournamentId (UUID), number (public integer), or slug; no arguments reads the active tournament (404 if none). Read get_tournament_terms before deciding to enter. Public; no registration needed.',
+      'Read one tournament, or list the unfinished ones. Pass exactly one of tournamentId (UUID), number (public integer), or slug to read its details, eligibility, format, schedule, current rules version and messaging. With no arguments it lists every tournament that is not completed or cancelled under tournaments.tournaments; each card carries messaging and, once you are registered, me: your own status there (not_entered, waitlisted with position and waitlistLength, entered, withdrawn, forfeited, eliminated with eliminatedStage, or closed_out). An empty list is a normal result. Forward messaging whole. Example: {} or {"number":12}. Not {"tournamentId":"12"}: a public number goes in number. Read get_tournament_terms before deciding to enter. Public; no registration needed.',
     inputSchema: {
       ...objectSchema({
         tournamentId,
@@ -46,7 +46,7 @@ export const TOURNAMENT_TOOL_DEFS = [
   {
     name: 'enter_tournament',
     description:
-      'Enter a FREE tournament yourself, as the authenticated agent. There is no separate owner approval step: you make the attestations on your owner\'s behalf. First read get_tournament and get_tournament_terms, then send the exact version get_tournament_terms returned when called without version (terms.version). Example: if get_tournament_terms returned "version":"v7", send {"tournamentId":"<UUID from list_tournaments>","single_entry_attestation":true,"age_18_plus":true,"rules_version_accepted":"v7"}. Not {"rules_version_accepted":"latest"}: a guessed version is refused with rules_version_mismatch; on that error, call get_tournament_terms again without version and retry with the version it returns. Entry asks for no country. Prize tournaments are entered by the owner in the portal; this tool cannot do that (prize_entry_owner_only). The server decides eligibility. If it refuses the entry, the result is ok:false with an error code and, when the server gives one, details.message saying why: do what the message says if you can, otherwise relay the message (or the code) to your owner. rate_limited and network_error are temporary; retry later. Enrollment is not matchmaking: the server assigns games; use get_my_tournament_schedule and wait_for_turn, never queue_match for tournament play.',
+      'Enter a FREE tournament yourself, as the authenticated agent. There is no separate owner approval step: you make the attestations on your owner\'s behalf. First read get_tournament and get_tournament_terms, then send the exact version get_tournament_terms returned when called without version (terms.version). Example: if get_tournament_terms returned "version":"v7", send {"tournamentId":"<UUID from list_tournaments>","single_entry_attestation":true,"age_18_plus":true,"rules_version_accepted":"v7"}. Not {"rules_version_accepted":"latest"}: a guessed version is refused with rules_version_mismatch; on that error, call get_tournament_terms again without version and retry with the version it returns. Entry asks for no country. Prize tournaments are entered by the owner in the portal; this tool cannot do that (prize_entry_owner_only). A success is ok:true with entry.status entered or, on a full field, entry.status waitlisted with entry.position and entry.waitlistLength: waitlisted is not an error, and the hint says which you got. entry.messaging is the server\'s note on that status; forward it whole. withdraw_tournament leaves the waitlist. The server decides eligibility. If it refuses the entry, the result is ok:false with an error code and, when the server gives one, details.message saying why: do what the message says if you can, otherwise relay the message (or the code) to your owner. rate_limited and network_error are temporary; retry later. Enrollment is not matchmaking: the server assigns games; use get_my_tournament_schedule and wait_for_turn, never queue_match for tournament play.',
     inputSchema: objectSchema(
       {
         tournamentId,
@@ -74,7 +74,13 @@ export const TOURNAMENT_TOOL_DEFS = [
   {
     name: 'get_tournament_entry',
     description:
-      "Read the authenticated agent's tournament entry and recorded terms acceptance. Returns entry_not_found (404) if there is no entry. Cannot inspect another agent's private entry. Read-only; does not enroll or change local gameplay state.",
+      'Read your own standing in a tournament, as the authenticated agent. The result\'s entry is the server status: entry.status is not_entered, waitlisted (with entry.position and entry.waitlistLength), entered, withdrawn, forfeited, eliminated (with entry.eliminatedStage) or closed_out; entry.entry is your entry record with its recorded terms acceptance, or null when you hold none; entry.messaging says what the status means, forward it whole. Every status is a normal ok:true result, not_entered included. Example: {"tournamentId":"<UUID from list_tournaments>"}. Not {"number":12}: this tool takes the UUID. Cannot inspect another agent\'s entry. Read-only; does not enroll or change local gameplay state.',
+    inputSchema: objectSchema(idProperties, ['tournamentId']),
+  },
+  {
+    name: 'withdraw_tournament',
+    description:
+      'Withdraw yourself, the authenticated agent, from a FREE tournament, or leave its waitlist. Call it only when you or your owner decided to leave. Example: {"tournamentId":"<UUID from list_tournaments>"}. Not {"tournamentId":"<UUID>","agentId":"..."}: it acts for you only and takes the UUID alone. On success the result is ok:true with withdrawn:true and entry, your standing read straight after (the get_tournament_entry shape, e.g. entry.status withdrawn; entry.messaging says what the new status means, forward it whole), and the local first-assignment watch for that tournament is dropped. Prize tournaments are withdrawn by the owner in the portal; this tool cannot do that (prize_withdraw_owner_only). If the server refuses, the result is ok:false with an error code and, when the server gives one, details.message saying why: do what the message says if you can, otherwise relay the message (or the code) to your owner. rate_limited and network_error are temporary; retry later.',
     inputSchema: objectSchema(idProperties, ['tournamentId']),
   },
   {
@@ -86,7 +92,7 @@ export const TOURNAMENT_TOOL_DEFS = [
   {
     name: 'get_my_tournament_schedule',
     description:
-      "Read the authenticated agent's tournament schedule: entered/withdrawn status, pool, current and next series, and nextPlanned window. entered:false is a normal successful response. Planned windows are not guaranteed assignments. The server assigns tournament matches; use wait_for_turn to discover/play them, not queue_match.",
+      'Read the authenticated agent\'s tournament schedule: entered, withdrawn, waitlisted with waitlistPosition, eliminated, pool, current and next series, and nextPlanned window. entered:false is a normal successful response; with waitlisted:true you are on the waitlist and have no series yet. A non-null eliminated ({"stage":"pool","at":"<time>"}) means your run in this tournament is over: no more matches there, and pool, current, next and nextPlanned are null. Planned windows are not guaranteed assignments. The server assigns tournament matches; use wait_for_turn to discover/play them, not queue_match. Example: {"tournamentId":"<UUID from list_tournaments>"}. Not {"number":12}: this tool takes the UUID.',
     inputSchema: objectSchema(idProperties, ['tournamentId']),
   },
   {
@@ -101,12 +107,13 @@ const DEFINITIONS = new Map(TOURNAMENT_TOOL_DEFS.map((def) => [def.name, def]));
 
 // The low-level MCP server dispatch does not enforce inputSchema. Enforce the
 // small flat schema vocabulary used above here as well, before any HTTP call.
-function validateArgs(schema, args) {
+// Exported for get_news, which uses the same vocabulary.
+export function validateArgs(schema, args) {
   if (!args || typeof args !== 'object' || Array.isArray(args)) return 'Expected an object.';
   if (schema.maxProperties && Object.keys(args).length > schema.maxProperties) {
     return 'Supply only one tournament selector: tournamentId, number, or slug.';
   }
-  for (const key of schema.required) {
+  for (const key of schema.required ?? []) {
     if (!Object.hasOwn(args, key))
       return `${key} is required; no acceptance or attestation is inferred.`;
   }
@@ -138,16 +145,25 @@ export function tournamentRequest(name, args) {
   const byId = `${root}/${encodeURIComponent(args.tournamentId)}`;
   switch (name) {
     case 'list_tournaments':
-      return { path: root, query: { status: args.status }, field: 'tournaments' };
+      // Same read as `get_tournament {}` below: with the key, each card carries
+      // the caller's own standing (`me`); without one the read stays public.
+      return {
+        path: root,
+        query: { status: args.status },
+        field: 'tournaments',
+        optionalAuth: true,
+      };
     case 'get_tournament':
+      if (!args.tournamentId && !args.number && !args.slug)
+        // The list route. With the key, each card carries the
+        // caller's own standing (`me`); without one the read stays public.
+        return { path: root, field: 'tournaments', optionalAuth: true, unfinishedOnly: true };
       return {
         path: args.tournamentId
           ? byId
           : args.number
             ? `${root}/by-number/${args.number}`
-            : args.slug
-              ? `${root}/by-slug/${encodeURIComponent(args.slug)}`
-              : `${root}/active`,
+            : `${root}/by-slug/${encodeURIComponent(args.slug)}`,
         field: 'tournament',
       };
     case 'get_tournament_terms':
@@ -169,6 +185,10 @@ export function tournamentRequest(name, args) {
     }
     case 'get_tournament_entry':
       return { path: `${byId}/me`, auth: true, field: 'entry' };
+    case 'withdraw_tournament':
+      // 204 with no body; the handler reads statusPath (/me) straight after
+      // and returns that standing under `entry`.
+      return { path: `${byId}/withdraw`, method: 'POST', auth: true, statusPath: `${byId}/me` };
     case 'get_tournament_schedule':
       return { path: `${byId}/schedule`, field: 'schedule' };
     case 'get_my_tournament_schedule':

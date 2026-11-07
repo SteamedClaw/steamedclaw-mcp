@@ -6,6 +6,16 @@ import { apiBaseUrl } from './state.mjs';
 import { DISCOVERY_POLL_INTERVAL_MS, WAKE_IDLE_DISCOVERY_INTERVAL_MS } from './config.mjs';
 
 const LIVE_STATUSES = new Set(['announced', 'registration', 'qualifying', 'seeding', 'bracket']);
+// The entry statuses (GET /api/tournaments/:id/me) that end any watch.
+// entered arms one; waitlisted keeps one with no entry id; any other value is
+// not evidence of anything.
+const FINAL_ENTRY_STATUSES = new Set([
+  'not_entered',
+  'withdrawn',
+  'forfeited',
+  'eliminated',
+  'closed_out',
+]);
 const states = new WeakMap();
 function stateFor(ctx) {
   if (!states.has(ctx))
@@ -30,8 +40,12 @@ function update(ctx, tournamentId, fn) {
   if (JSON.stringify(entries) !== JSON.stringify(rest)) ctx.store.writeEnrollmentWatches(rest);
 }
 
+/** An armed first-assignment watch: an entry with no assigned game yet. A
+ * waitlist place (entryId null) is kept and scanned, but is not armed. */
 export function hasEnrollmentWatch(ctx) {
-  return ctx.store.readEnrollmentWatches().some((entry) => !entry.assignedMatchId);
+  return ctx.store
+    .readEnrollmentWatches()
+    .some((entry) => typeof entry.entryId === 'string' && !entry.assignedMatchId);
 }
 
 export function enrollmentAssignment(ctx) {
@@ -53,18 +67,38 @@ export function consumeEnrollmentAssignment(ctx, matchId) {
   }
 }
 
-export function recordEnrollment(ctx, entry) {
-  if (typeof entry?.tournamentId !== 'string' || typeof entry?.entryId !== 'string') return;
+/** The watch entry id an entry status body supports: a string for entered,
+ * null for waitlisted, undefined when the body supports no watch. */
+function watchEntryId(status) {
+  if (status?.status === 'entered')
+    return typeof status.entry?.entryId === 'string' && status.entry.withdrawnAt == null
+      ? status.entry.entryId
+      : undefined;
+  return status?.status === 'waitlisted' ? null : undefined;
+}
+
+/** Save the watch an enter_tournament 201 (the entry status) supports. */
+export function recordEnrollment(ctx, status) {
+  const entryId = watchEntryId(status);
+  if (typeof status?.tournamentId !== 'string' || entryId === undefined) return;
   return serialized(ctx, () => {
-    update(ctx, entry.tournamentId, (old) =>
-      old?.entryId === entry.entryId
+    update(ctx, status.tournamentId, (old) =>
+      old?.entryId === entryId
         ? old
         : {
-            tournamentId: entry.tournamentId,
-            entryId: entry.entryId,
+            tournamentId: status.tournamentId,
+            entryId,
             matchIds: [],
           },
     );
+    stateFor(ctx).lastScan = null;
+  });
+}
+
+/** Drop the watch for one tournament (the agent withdrew or left its waitlist). */
+export function dropEnrollmentWatch(ctx, tournamentId) {
+  return serialized(ctx, () => {
+    update(ctx, tournamentId, () => null);
     stateFor(ctx).lastScan = null;
   });
 }
@@ -131,28 +165,29 @@ export function refreshEnrollmentWatches(ctx, creds, { force = false, timeoutMs 
           continue;
         }
         const root = `/api/tournaments/${encodeURIComponent(card.id)}`;
+        // /me answers 200 for every status, so only its status ends
+        // a watch; any other answer is transient.
         const mine = await read(`${root}/me`, true);
-        if (mine.status === 404 && mine.json?.error === 'entry_not_found') {
-          update(ctx, card.id, () => null);
-          continue;
-        }
         if (
           mine.status !== 200 ||
           mine.json?.tournamentId !== card.id ||
-          mine.json?.agentId !== creds.agentId ||
-          typeof mine.json?.entryId !== 'string'
+          mine.json?.agentId !== creds.agentId
         )
           continue;
-        if (mine.json.withdrawnAt != null) {
+        if (FINAL_ENTRY_STATUSES.has(mine.json.status)) {
           update(ctx, card.id, () => null);
           continue;
         }
-        const entryId = mine.json.entryId;
+        const entryId = watchEntryId(mine.json);
+        if (entryId === undefined) continue;
         update(ctx, card.id, (old) =>
           old?.entryId === entryId
             ? old
             : { tournamentId: card.id, entryId, gameId: card.gameId, matchIds: [] },
         );
+        // A waitlist place has no series to read until the server makes it
+        // an entry; a later scan arms the watch when /me reads entered.
+        if (entryId === null) continue;
         if (
           ctx.store.readEnrollmentWatches().find((entry) => entry.tournamentId === card.id)
             ?.assignedMatchId
@@ -165,9 +200,11 @@ export function refreshEnrollmentWatches(ctx, creds, { force = false, timeoutMs 
           continue;
         }
         if (schedule.status !== 200 || view?.tournamentId !== card.id) continue;
+        // A non-null eliminated means no more matches here.
         if (
           view.entered === false ||
           view.withdrawn === true ||
+          view.eliminated != null ||
           ['completed', 'cancelled'].includes(view.tournamentStatus)
         ) {
           update(ctx, card.id, () => null);

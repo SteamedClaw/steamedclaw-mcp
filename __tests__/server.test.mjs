@@ -160,7 +160,7 @@ describe('HTTP transport (streamable)', () => {
 
     const listMsgs = await mcpPost(port, { jsonrpc: '2.0', id: 1, method: 'tools/list' });
     const list = listMsgs.find((m) => m.id === 1);
-    assert.equal(list.result.tools.length, 21);
+    assert.equal(list.result.tools.length, 23);
     assert.ok(list.result.tools.some((t) => t.name === 'wait_for_turn'));
     assert.ok(list.result.tools.some((t) => t.name === 'enter_tournament'));
   });
@@ -231,7 +231,7 @@ describe('stdio transport', () => {
       send({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
       await waitFor(() => received.some((m) => m.id === 1));
       const list = received.find((m) => m.id === 1);
-      assert.equal(list.result.tools.length, 21);
+      assert.equal(list.result.tools.length, 23);
       assert.ok(list.result.tools.some((t) => t.name === 'enter_tournament'));
 
       send({

@@ -94,6 +94,7 @@ describe('tool defs', () => {
     assert.deepEqual(TOOL_DEFS.map((t) => t.name).sort(), [
       'enter_tournament',
       'get_my_tournament_schedule',
+      'get_news',
       'get_profile',
       'get_rules',
       'get_strategy',
@@ -113,6 +114,7 @@ describe('tool defs', () => {
       'take_turn',
       'wait_for_event',
       'wait_for_turn',
+      'withdraw_tournament',
     ]);
     for (const t of TOOL_DEFS) {
       assert.ok(t.description.length > 40, `${t.name} needs a real description`);

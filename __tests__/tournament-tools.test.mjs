@@ -31,22 +31,23 @@ function context(t, { registered = true, status = 200, json = {}, fail } = {}) {
     fetchImpl: async (url, init) => {
       calls.push({ url, ...init });
       if (fail) throw fail;
-      return new Response(JSON.stringify(json), { status });
+      return new Response(status === 204 ? null : JSON.stringify(json), { status });
     },
   };
 }
 
+// `auth`: true needs local credentials; 'optional' is a public read that sends
+// the key when the agent is registered (the list cards' `me`).
 const READS = [
-  ['list_tournaments', {}, '/api/tournaments', {}, false, 'tournaments'],
+  ['list_tournaments', {}, '/api/tournaments', {}, 'optional', 'tournaments'],
   [
     'list_tournaments',
     { status: 'live' },
     '/api/tournaments',
     { status: 'live' },
-    false,
+    'optional',
     'tournaments',
   ],
-  ['get_tournament', {}, '/api/tournaments/active', {}, false, 'tournament'],
   ['get_tournament', { tournamentId: ID }, `/api/tournaments/${ID}`, {}, false, 'tournament'],
   ['get_tournament', { number: 12 }, '/api/tournaments/by-number/12', {}, false, 'tournament'],
   [
@@ -126,26 +127,156 @@ for (const [name, args, path, query, auth, field] of READS) {
   });
 }
 
-test('public reads work before registration; account reads and entry require local credentials', async (t) => {
+test('public reads work before registration, sending no key; account reads and entry require local credentials', async (t) => {
   for (const [name, args, , , auth] of READS) {
     const ctx = context(t, { registered: false });
     const result = await dispatchTool(name, args, ctx);
-    assert.equal(result.ok, !auth);
-    assert.equal(ctx.calls.length, auth ? 0 : 1);
-    if (auth) assert.equal(result.error, 'not_registered');
-    else assert.equal(ctx.calls[0].url.origin, ctx.cfg.baseUrl);
+    const required = auth === true;
+    assert.equal(result.ok, !required);
+    assert.equal(ctx.calls.length, required ? 0 : 1);
+    if (required) assert.equal(result.error, 'not_registered');
+    else {
+      assert.equal(ctx.calls[0].url.origin, ctx.cfg.baseUrl);
+      assert.equal(ctx.calls[0].headers.Authorization, undefined);
+    }
   }
-  const ctx = context(t, { registered: false });
-  assert.equal((await dispatchTool('enter_tournament', ENTRY, ctx)).error, 'not_registered');
-  assert.equal(ctx.calls.length, 0);
+  for (const [name, args] of [
+    ['enter_tournament', ENTRY],
+    ['withdraw_tournament', { tournamentId: ID }],
+  ]) {
+    const ctx = context(t, { registered: false });
+    assert.equal((await dispatchTool(name, args, ctx)).error, 'not_registered');
+    assert.equal(ctx.calls.length, 0);
+  }
+});
+
+// A list card (route-schemas.ts tournamentCardSchema).
+function card(id, status, me) {
+  return {
+    id,
+    number: 12,
+    slug: `cup-${id.slice(0, 4)}`,
+    name: 'Cup',
+    gameId: 'nim',
+    gameName: 'Nim',
+    format: 'pool-bracket',
+    status,
+    registrationOpensAt: '2026-11-01T00:00:00.000Z',
+    registrationClosesAt: '2026-11-10T00:00:00.000Z',
+    startsAt: null,
+    endsAt: '2026-11-12T00:00:00.000Z',
+    completedAt: status === 'completed' ? '2026-11-05T00:00:00.000Z' : null,
+    prizeSummary: 'Badges',
+    prizePoolCents: 0,
+    entrantCount: 4,
+    maxEntrants: 8,
+    champion: null,
+    registrationOpen: status === 'registration',
+    messaging: { toAgent: `About ${id}.`, forOperator: `Owner line for ${id}.` },
+    me,
+  };
+}
+
+test('get_tournament {} lists the unfinished cards from the list route, whole, with the key when registered', async (t) => {
+  const waiting = { status: 'waitlisted', position: 1, waitlistLength: 2, eliminatedStage: null };
+  const cards = [
+    card('22222222-2222-4222-8222-222222222222', 'registration', waiting),
+    card('33333333-3333-4333-8333-333333333333', 'completed', null),
+    card('44444444-4444-4444-8444-444444444444', 'bracket', {
+      status: 'eliminated',
+      position: null,
+      waitlistLength: null,
+      eliminatedStage: 'pool',
+    }),
+    card('55555555-5555-4555-8555-555555555555', 'cancelled', null),
+  ];
+  for (const registered of [true, false]) {
+    const ctx = context(t, { registered, json: { filter: 'all', tournaments: cards } });
+    const result = await dispatchTool('get_tournament', {}, ctx);
+    assert.equal(result.ok, true);
+    assert.equal(result.tournament, undefined);
+    assert.deepEqual(result.tournaments, { tournaments: [cards[0], cards[2]] });
+    assert.equal(ctx.calls.length, 1);
+    const call = ctx.calls[0];
+    assert.equal(call.method, 'GET');
+    assert.equal(call.url.pathname, '/api/tournaments');
+    assert.deepEqual(Object.fromEntries(call.url.searchParams), {});
+    assert.equal(call.headers.Authorization, registered ? `Bearer ${KEY}` : undefined);
+  }
+  // An empty list is a normal result.
+  const empty = context(t, { json: { filter: 'all', tournaments: [] } });
+  assert.deepEqual((await dispatchTool('get_tournament', {}, empty)).tournaments, {
+    tournaments: [],
+  });
+});
+
+test('no tool reads /api/tournaments/active', () => {
+  const source = fs.readFileSync(new URL('../src/tournament-tools.mjs', import.meta.url), 'utf8');
+  const tools = fs.readFileSync(new URL('../src/tools.mjs', import.meta.url), 'utf8');
+  for (const text of [source, tools]) assert.doesNotMatch(text, /\/active\b|no_active_tournament/);
+});
+
+test('withdraw_tournament validates its input before any HTTP call', async (t) => {
+  for (const args of [
+    {},
+    { tournamentId: 'not-a-uuid' },
+    { tournamentId: ID, agentId: 'other' },
+    { number: 12 },
+  ]) {
+    const ctx = context(t);
+    assert.equal((await dispatchTool('withdraw_tournament', args, ctx)).error, 'invalid_argument');
+    assert.equal(ctx.calls.length, 0);
+  }
+});
+
+test('withdraw_tournament posts once with the key and no body', async (t) => {
+  const ctx = context(t, { status: 204, json: null });
+  const result = await dispatchTool('withdraw_tournament', { tournamentId: ID }, ctx);
+  assert.equal(result.ok, true);
+  const [post, read] = ctx.calls;
+  assert.equal(post.method, 'POST');
+  assert.equal(post.url.pathname, `/api/tournaments/${ID}/withdraw`);
+  assert.equal(post.headers.Authorization, `Bearer ${KEY}`);
+  assert.equal(post.body, undefined);
+  assert.equal(read.method, 'GET');
+  assert.equal(read.url.pathname, `/api/tournaments/${ID}/me`);
+  assert.equal(read.headers.Authorization, `Bearer ${KEY}`);
+});
+
+test('withdraw_tournament: common errors keep their conventions', async (t) => {
+  const unauthorized = context(t, { status: 401, json: { error: 'bad_key' } });
+  assert.equal(
+    (await dispatchTool('withdraw_tournament', { tournamentId: ID }, unauthorized)).error,
+    'unauthorized',
+  );
+  const offline = context(t, { fail: new Error('offline') });
+  assert.equal(
+    (await dispatchTool('withdraw_tournament', { tournamentId: ID }, offline)).error,
+    'network_error',
+  );
 });
 
 test('entry sends only explicit attestations and accepted version, preserves gameplay state', async (t) => {
+  // The entry status (tournamentEntryStatusResponseSchema).
   const entry = {
     tournamentId: ID,
-    entryId: 'entry-test',
     agentId: 'self',
-    rulesVersionAccepted: 'v1',
+    status: 'entered',
+    position: null,
+    waitlistLength: null,
+    entry: {
+      entryId: 'entry-test',
+      tournamentId: ID,
+      agentId: 'self',
+      ownerId: 'owner-1',
+      socialHandle: null,
+      enteredAt: '2026-11-06T10:00:00.000Z',
+      withdrawnAt: null,
+      rulesVersionAccepted: 'v1',
+      rulesContentHashAccepted: 'hash-1',
+    },
+    eliminatedStage: null,
+    messaging: { toAgent: 'You are in.', forOperator: 'Your agent entered.' },
   };
   const ctx = context(t, { status: 201, json: entry });
   ctx.store.writeCurrentMatch({ matchId: 'playing', gameId: 'nim' });
@@ -228,7 +359,7 @@ test('server refusals retain status, code and owner guidance without retrying ac
     [403, 'insufficient_match_activity'],
     [404, 'entry_not_found'],
     [409, 'rules_version_mismatch'],
-    [409, 'tournament_field_full'],
+    [409, 'max_concurrent_entries_reached'],
     [410, 'registration_closed'],
     [503, 'unavailable'],
   ]) {
@@ -247,7 +378,7 @@ test('server refusals retain status, code and owner guidance without retrying ac
 test('a server refusal with no message still returns its code, status and details', async (t) => {
   for (const [status, error] of [
     [403, 'agent_not_claimed_for_tournament'],
-    [409, 'tournament_field_full'],
+    [409, 'owner_already_entered'],
   ]) {
     const ctx = context(t, { status, json: { error } });
     const result = await dispatchTool('enter_tournament', ENTRY, ctx);
@@ -271,7 +402,10 @@ test('common auth, throttling, malformed response and network errors use existin
   assert.equal((await dispatchTool('list_tournaments', {}, throttled)).error, 'rate_limited');
   for (const json of [null, [], 'not json object']) {
     const ctx = context(t, { json });
-    assert.equal((await dispatchTool('get_tournament', {}, ctx)).error, 'unexpected_status');
+    assert.equal(
+      (await dispatchTool('get_tournament', { number: 1 }, ctx)).error,
+      'unexpected_status',
+    );
   }
   const offline = context(t, { fail: new Error('offline') });
   assert.equal((await dispatchTool('list_tournaments', {}, offline)).error, 'network_error');
@@ -357,4 +491,63 @@ test('enter_tournament text matches the server: a free tournament is self-entere
   assert.match(props.rules_version_accepted.description, /when called without version/);
   assert.match(props.single_entry_attestation.description, /on your owner's behalf/);
   assert.match(props.age_18_plus.description, /on your owner's behalf/);
+});
+
+test('status tool text names the entry statuses, eliminated and list fields as mechanics', () => {
+  const text = (name) => TOOL_DEFS.find((tool) => tool.name === name).description;
+  const STATUSES = [
+    'not_entered',
+    'waitlisted',
+    'entered',
+    'withdrawn',
+    'forfeited',
+    'eliminated',
+    'closed_out',
+  ];
+  for (const name of ['get_tournament_entry', 'get_tournament']) {
+    for (const status of STATUSES)
+      assert.match(text(name), new RegExp('\\b' + status + '\\b'), name);
+  }
+  assert.match(text('get_tournament_entry'), /entry\.position and entry\.waitlistLength/);
+  assert.match(text('get_tournament_entry'), /entry\.eliminatedStage/);
+  assert.match(text('get_tournament_entry'), /Every status is a normal ok:true result/);
+  assert.doesNotMatch(text('get_tournament_entry'), /entry_not_found|404/);
+  assert.match(text('get_tournament'), /With no arguments it lists/);
+  assert.match(text('get_tournament'), /not completed or cancelled/);
+  assert.match(text('get_tournament'), /messaging/);
+  assert.doesNotMatch(text('get_tournament'), /active tournament/);
+  assert.match(
+    text('enter_tournament'),
+    /waitlisted with entry\.position and entry\.waitlistLength/,
+  );
+  assert.match(text('enter_tournament'), /waitlisted is not an error/);
+  assert.match(text('enter_tournament'), /entry\.messaging/);
+  assert.match(text('get_my_tournament_schedule'), /waitlisted:true/);
+  assert.match(text('get_my_tournament_schedule'), /waitlistPosition/);
+  assert.match(text('get_my_tournament_schedule'), /non-null eliminated/);
+  assert.match(text('get_my_tournament_schedule'), /run in this tournament is over/);
+  const described = [
+    'get_tournament',
+    'get_tournament_entry',
+    'withdraw_tournament',
+    'get_my_tournament_schedule',
+  ];
+  // Literal example plus a negative, the house shape for LLM-facing text.
+  for (const name of described) assert.match(text(name), /Example: \{/, name);
+  for (const name of described) assert.match(text(name), /Not \{/, name);
+  // Mechanics only: no eligibility rule in the text.
+  for (const name of described)
+    assert.doesNotMatch(
+      text(name),
+      /claim|activity|minimum|at least \d+ match|registration window|field.cap|cannot (re-)?enter|\bfinal\b|one entry per/i,
+      name,
+    );
+  assert.match(text('withdraw_tournament'), /FREE tournament/);
+  assert.match(text('withdraw_tournament'), /leave its waitlist/);
+  assert.match(text('withdraw_tournament'), /prize_withdraw_owner_only/);
+  assert.match(text('withdraw_tournament'), /details\.message/);
+  assert.match(text('withdraw_tournament'), /rate_limited and network_error are temporary/);
+  // No em-dashes in the new or changed client text.
+  for (const name of [...described, 'enter_tournament', 'get_news'])
+    assert.doesNotMatch(JSON.stringify(TOOL_DEFS.find((tool) => tool.name === name)), /—/, name);
 });

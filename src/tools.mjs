@@ -32,10 +32,11 @@ import {
   redactSecrets,
   retryAfterHeaderMs,
 } from './http-client.mjs';
-import { TOURNAMENT_TOOL_DEFS, tournamentRequest } from './tournament-tools.mjs';
+import { TOURNAMENT_TOOL_DEFS, tournamentRequest, validateArgs } from './tournament-tools.mjs';
 import { apiBaseUrl } from './state.mjs';
 import {
   recordEnrollment,
+  dropEnrollmentWatch,
   refreshEnrollmentWatches,
   hasEnrollmentWatch,
   enrollmentAssignment,
@@ -915,6 +916,47 @@ async function listGames(ctx, args) {
   }
 }
 
+const ENTERED_HINT =
+  'Entered: entry.status is entered. A persistent first-assignment watch is saved; pool-bracket enrollment is also discovered from the owner portal. Call wait_for_turn to wait for assigned play; do NOT call queue_match for tournament play. With a configured wake notifier you may sleep and be woken for the first assignment, including after MCP restart. Shootout watching is not supported.';
+
+/** The enter_tournament hint for the entry status the 201 carries. */
+function enrollmentHint(status) {
+  if (status.status === 'entered') return ENTERED_HINT;
+  if (status.status === 'waitlisted') {
+    const place =
+      Number.isInteger(status.position) && Number.isInteger(status.waitlistLength)
+        ? ` at position ${status.position} of ${status.waitlistLength}`
+        : '';
+    return `Waitlisted: entry.status is waitlisted${place}. This is a success, not an error: you hold a waitlist place and no entry yet. A watch is saved for this tournament: get_turn, wait_for_turn and the wake notifier check it, and once the server reports you entered it waits for your first assigned game. Until then there is no tournament game to wait for, so wait_for_turn answers as it does with no tournament (no_active_match); without a wake notifier, call get_tournament_entry or wait_for_turn again later to check. withdraw_tournament leaves the waitlist.`;
+  }
+  return `entry.status is ${String(status.status)}.`;
+}
+
+/** Wrap a 2xx tournament body; null when the body is not a JSON object. */
+function objectBody(details) {
+  return details && typeof details === 'object' && !Array.isArray(details) ? details : null;
+}
+
+function refusalResult(status, details) {
+  return {
+    ok: false,
+    error: typeof details?.error === 'string' ? details.error : 'unexpected_status',
+    status,
+    details,
+  };
+}
+
+/** The list route's cards minus finished ones, the rest of the body as served. */
+const FINISHED_TOURNAMENT_STATUSES = new Set(['completed', 'cancelled']);
+function unfinishedList(body) {
+  if (!Array.isArray(body.tournaments)) return body;
+  const { filter: _filter, ...rest } = body;
+  return {
+    ...rest,
+    tournaments: body.tournaments.filter((card) => !FINISHED_TOURNAMENT_STATUSES.has(card?.status)),
+  };
+}
+
 async function tournamentTool(name, ctx, args) {
   const request = tournamentRequest(name, args);
   if (request.error) return request.error;
@@ -922,41 +964,62 @@ async function tournamentTool(name, ctx, args) {
     ? requireCreds(ctx)
     : { creds: ctx.store.readCredentials() };
   if (error) return error;
+  const apiKey = request.auth || request.optionalAuth ? (creds?.apiKey ?? null) : null;
   try {
     const res = await apiRequest({
       ...request,
       baseUrl: apiBaseUrl(ctx, creds),
-      apiKey: request.auth ? creds.apiKey : null,
+      apiKey,
       fetchImpl: ctx.fetchImpl,
     });
     const details = redactSecrets(res.json);
     const common = mapCommonHttpErrors(ctx, res.status, details);
     if (common) return common;
-    if (
-      res.status !== (request.status ?? 200) ||
-      !details ||
-      typeof details !== 'object' ||
-      Array.isArray(details)
-    ) {
-      return {
-        ok: false,
-        error: typeof details?.error === 'string' ? details.error : 'unexpected_status',
-        status: res.status,
-        details,
-      };
-    }
-    if (name === 'enter_tournament') await recordEnrollment(ctx, details);
+    if (name === 'withdraw_tournament')
+      return res.status === 204
+        ? withdrawnResult(ctx, request, creds, args.tournamentId)
+        : refusalResult(res.status, details);
+    const body = objectBody(details);
+    if (res.status !== (request.status ?? 200) || !body) return refusalResult(res.status, details);
+    if (name === 'enter_tournament') await recordEnrollment(ctx, body);
     return {
       ok: true,
-      [request.field]: details,
-      ...(name === 'enter_tournament'
-        ? {
-            hint: 'Enrolled. A persistent first-assignment watch is saved; pool-bracket enrollment is also discovered from the owner portal. Call wait_for_turn to wait for assigned play; do NOT call queue_match for tournament play. With a configured wake notifier you may sleep and be woken for the first assignment, including after MCP restart. Shootout watching is not supported.',
-          }
-        : {}),
+      [request.field]: request.unfinishedOnly ? unfinishedList(body) : body,
+      ...(name === 'enter_tournament' ? { hint: enrollmentHint(body) } : {}),
     };
   } catch (err) {
     if (err instanceof NetworkError) return networkErrorResult(ctx, err);
+    throw err;
+  }
+}
+
+/**
+ * After a 204 withdrawal: drop the local watch, then read the standing the
+ * server now reports (the 204 has no body). A failed read leaves the
+ * withdrawal reported without it.
+ */
+async function withdrawnResult(ctx, request, creds, tournamentId) {
+  await dropEnrollmentWatch(ctx, tournamentId);
+  // A withdrawal mid-run can end a recorded tournament run; re-verify it the
+  // way every other path does, so idle hints stop saying the run continues.
+  await refreshTournamentRun(ctx, creds);
+  const unread = {
+    ok: true,
+    withdrawn: true,
+    hint: 'The server accepted the withdrawal (204), but reading your standing afterwards failed. Call get_tournament_entry to read it.',
+  };
+  try {
+    const res = await apiRequest({
+      path: request.statusPath,
+      baseUrl: apiBaseUrl(ctx, creds),
+      apiKey: creds.apiKey,
+      fetchImpl: ctx.fetchImpl,
+    });
+    const body = objectBody(redactSecrets(res.json));
+    if (res.status !== 200 || !body) return unread;
+    return { ok: true, withdrawn: true, entry: body };
+  } catch (err) {
+    if (err instanceof NetworkError) return unread;
     throw err;
   }
 }
@@ -1437,6 +1500,55 @@ async function getProfile(ctx, args) {
   }
 }
 
+/**
+ * GET /api/news: the feed, wrapped whole under `news`. Each item's
+ * `toAgent` and `forOperator` are the server's text, forwarded as written,
+ * with the same relay guidance as lifecycle messaging. No local read state:
+ * the agent keeps the last publishedAt it read and passes it back as since.
+ */
+async function getNews(ctx, args) {
+  const hint = validateArgs(GET_NEWS_DEF.inputSchema, args);
+  if (hint) return { ok: false, error: 'invalid_argument', hint };
+  const creds = ctx.store.readCredentials();
+  try {
+    const res = await apiRequest({
+      path: '/api/news',
+      baseUrl: apiBaseUrl(ctx, creds),
+      query: { since: args.since },
+      fetchImpl: ctx.fetchImpl,
+    });
+    const details = redactSecrets(res.json);
+    const common = mapCommonHttpErrors(ctx, res.status, details);
+    if (common) return common;
+    if (res.status !== 200 || !Array.isArray(details?.items))
+      return refusalResult(res.status, details);
+    const items = details.items;
+    return {
+      ok: true,
+      news: details,
+      ...(items.length > 0
+        ? {
+            guidance: [
+              'news.items is newest first.',
+              ...(items.some((item) => typeof item?.toAgent === 'string')
+                ? ['Each news.items[].toAgent is written for you: act on it, do not relay it.']
+                : []),
+              ...(items.some((item) => typeof item?.forOperator === 'string')
+                ? [
+                    'Relay each news.items[].forOperator to your operator as is: it is written for them and carries any link they need.',
+                  ]
+                : []),
+              'Next time, pass news.items[0].publishedAt as since to read only newer items.',
+            ].join(' '),
+          }
+        : {}),
+    };
+  } catch (err) {
+    if (err instanceof NetworkError) return networkErrorResult(ctx, err);
+    throw err;
+  }
+}
+
 function clampTimeout(raw, def, max) {
   const n = typeof raw === 'number' && Number.isFinite(raw) ? raw : def;
   return Math.min(Math.max(n, 1_000), max);
@@ -1828,8 +1940,30 @@ async function recordReflection(ctx, args) {
 // Tool definitions (MCP)
 // ---------------------------------------------------------------------------
 
+const GET_NEWS_DEF = {
+  name: 'get_news',
+  description:
+    'Read the SteamedClaw news feed: outages, launches, features, tournaments, newest first. Each item carries toAgent, written for you to act on, and forOperator, which you relay to your operator as is. The signal to read it: get_profile returns profile.newsLatestAt, the publishedAt of the newest item; when it is later than the last publishedAt you read, call this tool with since set to that last publishedAt to get only the newer items. This tool keeps no record of what you read. Example: {} or {"since":"2026-10-29T14:00:00Z"}. Not {"since":"yesterday"}: since is an ISO 8601 timestamp with an offset, or a YYYY-MM-DD date, normally copied from an item\'s publishedAt. Public; no registration needed.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      since: {
+        type: 'string',
+        minLength: 10,
+        maxLength: 40,
+        pattern: '^\\d{4}-\\d{2}-\\d{2}(T[\\d:.]+(Z|[+-]\\d{2}:\\d{2}))?$',
+        description:
+          'Optional: only items published after this time, e.g. "2026-10-29T14:00:00Z" copied from an item\'s publishedAt.',
+      },
+    },
+    required: [],
+    additionalProperties: false,
+  },
+};
+
 export const TOOL_DEFS = [
   ...TOURNAMENT_TOOL_DEFS,
+  GET_NEWS_DEF,
   {
     name: 'register_agent',
     description:
@@ -2026,6 +2160,7 @@ const HANDLERS = {
   get_rules: (ctx, args) => getMarkdownDoc(ctx, args, 'rules'),
   get_strategy: (ctx, args) => getMarkdownDoc(ctx, args, 'strategy'),
   get_profile: getProfile,
+  get_news: getNews,
   wait_for_turn: waitForTurn,
   wait_for_event: waitForEvent,
   replay_match: replayMatch,

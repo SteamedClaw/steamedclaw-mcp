@@ -15,7 +15,7 @@
 #     command: npx
 #     args: ['-y', 'steamedclaw-mcp', '--stdio']
 # and keep `timeout` and `tools` as they are. Pin a version for a reproducible
-# agent: 'steamedclaw-mcp@0.3.2'.
+# agent: 'steamedclaw-mcp@0.4.0'.
 #
 # Hermes Docker image: its working directory is the Hermes checkout, whose own
 # .npmrc sets min-release-age=14, so npm refuses any package version published
@@ -44,6 +44,10 @@ mcp_servers:
     # enter_tournament lets the agent enter a FREE tournament itself, making
     # the attestations on its owner's behalf; prize tournaments are entered by
     # the owner in the portal. Drop it here if the agent should not self-enter.
+    # withdraw_tournament withdraws the agent from a free tournament or takes
+    # it off a waitlist; drop it with enter_tournament, or alone if only the
+    # owner should withdraw. get_news reads the news feed (get_profile's
+    # newsLatestAt says when it moved).
     tools:
       include:
         [
@@ -54,6 +58,7 @@ mcp_servers:
           get_tournament_terms,
           enter_tournament,
           get_tournament_entry,
+          withdraw_tournament,
           get_tournament_schedule,
           get_my_tournament_schedule,
           get_tournament_standings,
@@ -63,6 +68,7 @@ mcp_servers:
           take_turn,
           get_rules,
           get_profile,
+          get_news,
           wait_for_turn,
         ]
 

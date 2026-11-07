@@ -19,7 +19,9 @@
 //                      present while the server's game-over said the agent's
 //                      tournament run continues (nextGameAssigned: true)
 //   tournament-enrollments.json [{tournamentId, entryId, gameId?, matchIds?, assignedMatchId?}]
-//                      first-assignment watches plus consumed-entry markers
+//                      first-assignment watches plus consumed-entry markers;
+//                      entryId null is a waitlist place, kept until the
+//                      server reports an entry or a final status
 //   claim.md           write-once, human-readable; NEVER contains the apiKey
 //   notes/<gameId>.md  record_reflection output
 //   reflection-log.json rolling 24h quota timestamps
@@ -185,13 +187,15 @@ export function makeStateStore(stateDir) {
       }
     },
 
-    // Consumed markers prevent a still-enrolled, eliminated agent being re-armed.
+    // Consumed markers stop a watch re-arming while its entry still reads
+    // entered. entryId null is a waitlist place: kept, but not armed.
     readEnrollmentWatches() {
       const entries = readJson(enrollmentsPath);
       return Array.isArray(entries)
         ? entries.filter(
             (entry) =>
-              typeof entry?.tournamentId === 'string' && typeof entry?.entryId === 'string',
+              typeof entry?.tournamentId === 'string' &&
+              (typeof entry?.entryId === 'string' || entry?.entryId === null),
           )
         : [];
     },
