@@ -2,10 +2,13 @@
 
 NanoClaw (`nanocoai/nanoclaw`) integration for the SteamedClaw MCP server.
 Everything here was grounded against the pinned NanoClaw
-source `v2.1.17` / `ee7f8916` via the nanoclaw-expert tools. NanoClaw ships
-**no config validator**, so nothing below is "validated" — the strongest claim
-is **shape-verified against the real interfaces at the pin**. Re-verify against
-NanoClaw's own source before relying on this at a newer version.
+source `v2.1.17` / `ee7f8916` via the nanoclaw-expert tools; the MCP server
+shape and the npm-package section were re-checked against `v2026.10.0`
+(`7203e00d`) on 2026-11-09, when the `/get-started` steps were run end to end
+on that version. Where a line still says "at the pin", it means `v2.1.17`.
+NanoClaw ships **no config validator**, so nothing below is "validated" — the
+strongest claim is **shape-verified against the real interfaces**. Re-verify
+against NanoClaw's own source before relying on this at a newer version.
 
 ## The config surface is `container.json`, NOT `.mcp.json`
 
@@ -17,11 +20,14 @@ the pin; the one `docs/SPEC.md` mention is stale). MCP servers are configured
 to the Claude Agent SDK as the `mcpServers` option
 (`container/agent-runner/src/index.ts` → `providers/claude.ts`).
 
-The real shape (`src/container-config.ts`):
+The real shape (`src/container-config.ts`, `v2026.10.0`):
 
 ```ts
-McpServerConfig  { command: string; args?: string[]; env?: Record<string,string>;
-                   instructions?: string }   // stdio only — no url/type field at the pin
+McpServerConfig  = McpStdioServerConfig | McpHttpServerConfig
+McpStdioServerConfig { command: string; args?: string[]; env?: Record<string,string>;
+                       instructions?: string }
+McpHttpServerConfig  { type: 'http'; url: string; headers?: Record<string,string>;
+                       instructions?: string }   // added after v2.1.17 (stdio only there)
 ContainerConfig  { mcpServers: Record<string, McpServerConfig>;
                    packages: { apt: string[]; npm: string[] };
                    additionalMounts: AdditionalMountConfig[];   // {hostPath, containerPath, readonly?}
@@ -109,14 +115,16 @@ The server must be reachable *inside* the container. Two options:
   also **fail-closed** against the allowlist: blocked unless the host path is
   under an `allowedRoots` entry in `~/.config/nanoclaw/mount-allowlist.json`
   (see below).
-- **npm package (`steamedclaw-mcp`):** add it via
+- **npm package (`steamedclaw-mcp`), the route the `/get-started` tile uses:**
+  `command: "npx"`, `args: ["-y", "steamedclaw-mcp", "--stdio"]`. Run end to
+  end on NanoClaw `v2026.10.0` against stage on 2026-11-09: the agent
+  registered, played a Tic Tac Toe game to the end and read tournaments and
+  news through the published `steamedclaw-mcp@0.4.0`. The agent image's npm
+  has no release-age setting, so an unpinned `npx` picks up the newest
+  release. `-y` needs registry egress at spawn. The alternative,
   `config add-package --npm steamedclaw-mcp` (baked into the per-group image
-  with pnpm at build time) or run `command: "npx"`, `args: ["-y",
-  "steamedclaw-mcp", "--stdio"]`. Caveats: `npx` is standard on the node base
-  image but not proven from NanoClaw's source, `-y` needs registry egress at
-  spawn, and the pnpm-baked install location/PATH exposure has not been smoked
-  on a NanoClaw install yet. The mounted checkout is the proven option; the
-  package route needs one smoke on your install before you rely on it.
+  with pnpm at build time), has not been run; if you use it, check where pnpm
+  puts the binary before relying on it.
 
 Env (per-server `env` in the MCP entry — this is the sanctioned way to pass
 env; the container itself receives only `TZ`):
@@ -135,9 +143,11 @@ See `nanoclaw-container-config.example.json` for the full seed file.
 ## Topology B: shared MCP endpoint (fleet)
 
 Run the sidecar yourself in HTTP mode (`node index.mjs`, one process + port +
-state dir **per agent**) and connect the agent to it. NanoClaw's
-`McpServerConfig` has no `url` field at the pin, so the shape-safe way is a
-**stdio→HTTP bridge** as the command:
+state dir **per agent**) and connect the agent to it. Since `v2026.10.0`
+NanoClaw takes an HTTP MCP server directly (`ncl groups config add-mcp-server
+--url ... [--headers ...]`; plain `http://` is accepted only for localhost and
+`host.docker.internal`, otherwise HTTPS). At `v2.1.17` there was no `url`
+field, so the shape-safe way there is a **stdio→HTTP bridge** as the command:
 
 ```
 command: "npx", args: ["-y", "mcp-remote", "http://host.docker.internal:8765/mcp"]
